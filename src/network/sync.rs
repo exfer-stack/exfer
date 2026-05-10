@@ -67,6 +67,16 @@ pub struct LogicalPeer {
     /// would inherit its predecessor's usefulness credit and dodge the
     /// "newest peer in target group is least proven" eviction rule.
     pub last_useful_message_at: Option<Instant>,
+    /// v1.10.1: sticky per-identity post-anchor IBD eligibility flag.
+    /// Set on every path that newly elevates this peer's tip to
+    /// `confirmed = true` (literal or variable-bound). NOT cleared on
+    /// session reconnect, in contrast to `tip.confirmed` which
+    /// `attach_session()` resets to `false`. Used by the post-anchor IBD
+    /// candidate filter to keep a previously-proven peer eligible after
+    /// a session drop, preventing the cold-bootstrap hang where the only
+    /// proven peer's reconnect deterministically loses IBD eligibility
+    /// (see review/v1_10_1_s1_ibd_orchestrator_hang_spec.md).
+    pub ever_confirmed_for_ibd: bool,
 }
 
 pub struct PeerRegistry {
@@ -553,6 +563,7 @@ impl PeerRegistry {
             tip: None,
             ibd_cooldown_until: None,
             last_useful_message_at: None,
+            ever_confirmed_for_ibd: false,
         });
 
         // Apply dial_addr_hint
@@ -5003,6 +5014,8 @@ async fn handle_background_event_with_dispatch(
                                 });
                                 node_arc.ever_confirmed_peer.store(true, Ordering::Relaxed);
                                 lp.last_useful_message_at = Some(Instant::now());
+                                // v1.10.1: sticky per-identity flag.
+                                lp.ever_confirmed_for_ibd = true;
                             }
                         }
                         info!(
@@ -5861,6 +5874,8 @@ async fn flip_stage_b_anchor_apply(node: &Node, peer_identity: PeerId) {
         if let Some(tip) = lp.tip.as_mut() {
             tip.confirmed = true;
         }
+        // v1.10.1: sticky per-identity flag, persists across reconnect.
+        lp.ever_confirmed_for_ibd = true;
     }
     info!(
         "Stage B anchor-apply: block at ASSUME_VALID_HEIGHT={} applied via {:?}; ever_confirmed_peer=true, tip.confirmed=true",
@@ -6301,6 +6316,7 @@ pub async fn run_outbound_manager(node: Arc<Node>) {
                                     tip: None,
                                     ibd_cooldown_until: None,
                                     last_useful_message_at: None,
+                                    ever_confirmed_for_ibd: false,
                                 });
                             }
                             peers.bind_dial_addr(id, addr);
@@ -6431,6 +6447,7 @@ pub async fn run_outbound_manager(node: Arc<Node>) {
                                     tip: None,
                                     ibd_cooldown_until: None,
                                     last_useful_message_at: None,
+                                    ever_confirmed_for_ibd: false,
                                 });
                             }
                             peers.bind_dial_addr(id, addr);
@@ -6748,7 +6765,14 @@ pub async fn run_sync_manager(node: Arc<Node>, mut rx: mpsc::Receiver<PeerEvent>
                 // IBD candidate check — only confirmed peers can trigger IBD.
                 // Unconfirmed handshake tips are just claims; a malicious peer
                 // can claim any height/work to suppress mining.
-                if !tip.confirmed {
+                //
+                // v1.10.1: also accept peers that were previously proven via an
+                // on-chain proof path (sticky `ever_confirmed_for_ibd`). This
+                // closes the cold-bootstrap hang where the only proven peer's
+                // session drop deterministically clears `tip.confirmed` on
+                // reconnect (`attach_session()` at sync.rs:570–573), trapping
+                // the supervisor with no eligible IBD candidate.
+                if !tip.confirmed && !lp.ever_confirmed_for_ibd {
                     continue;
                 }
                 let cooldown_ok = lp
@@ -6866,6 +6890,13 @@ pub async fn run_sync_manager(node: Arc<Node>, mut rx: mpsc::Receiver<PeerEvent>
                                                 block_id,
                                                 confirmed,
                                             });
+                                            // v1.10.1: sticky per-identity flag,
+                                            // set when post-IBD verification proved
+                                            // the peer (variable-bound `confirmed`
+                                            // missed by literal-grep audits).
+                                            if confirmed {
+                                                lp.ever_confirmed_for_ibd = true;
+                                            }
                                         }
                                     }
                                     if from_identity == peer_identity
@@ -7220,6 +7251,8 @@ pub async fn run_sync_manager(node: Arc<Node>, mut rx: mpsc::Receiver<PeerEvent>
                                                                     // is the strongest possible useful-
                                                                     // message signal for this peer.
                                                                     lp.last_useful_message_at = Some(Instant::now());
+                                                                    // v1.10.1: sticky per-identity flag.
+                                                                    lp.ever_confirmed_for_ibd = true;
                                                                 }
                                                             }
                                                             info!(
@@ -7349,6 +7382,8 @@ pub async fn run_sync_manager(node: Arc<Node>, mut rx: mpsc::Receiver<PeerEvent>
                                     // confirmed:true write site.
                                     node.ever_confirmed_peer
                                         .store(true, Ordering::Relaxed);
+                                    // v1.10.1: sticky per-identity flag.
+                                    lp.ever_confirmed_for_ibd = true;
                                 }
                             }
                         } else {
@@ -8040,6 +8075,7 @@ mod eviction_tests {
                 tip: None,
                 ibd_cooldown_until: None,
                 last_useful_message_at: last_useful,
+                ever_confirmed_for_ibd: false,
             },
         );
     }

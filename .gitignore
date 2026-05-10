@@ -17,3 +17,15 @@ fuzz-*.log
 task_server.py
 tasks.db
 docs/external/
+
+# Internal development documents — never commit. Specs, expert-review briefs,
+# planning notes, and design docs all go in these folders. Public-facing
+# documentation belongs in README.md, EXFER.md, SKILL.md, SECURITY.md, or docs/.
+review/
+plan/
+plans/
+design/
+internal/
+working-notes/
+scratch/
+*.draft.md
