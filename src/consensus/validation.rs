@@ -1626,6 +1626,160 @@ pub fn validate_and_apply_block_transactions_atomic(
     Ok((total_fees, spent_utxos))
 }
 
+/// Apply a block's transactions to `utxo_set` WITHOUT validating signatures
+/// or scripts. The block is **trusted**: this is only safe when replaying our
+/// own previously-validated chain at or below
+/// [`crate::types::ASSUME_VALID_HEIGHT`] (or under explicit operator opt-in).
+///
+/// Returns the same shape as [`validate_and_apply_block_transactions_atomic`]
+/// — `(total_fees, spent_utxos)` — so it is a drop-in replacement at the
+/// replay call-site.
+///
+/// What is skipped vs the validated path:
+/// - `validate_transaction` is not called (no Ed25519 signature verify, no
+///   script/covenant execution, no per-input cost-budget bookkeeping).
+/// - `validate_coinbase` is not called (coinbase reward sum is also trusted).
+///
+/// What is preserved:
+/// - UTXO state mutation via [`UtxoSet::apply_transaction`] — structural
+///   failures (missing input UTXO, double-spend within block, intra-block
+///   conflict) still propagate as errors with full rollback.
+/// - `spent_utxos` collection (incl. intra-block dependency spends) so the
+///   caller can persist undo metadata identically.
+/// - The undo-metadata size cap ([`crate::types::MAX_SPENT_UTXOS_SIZE`]).
+/// - The downstream per-block state-root check, which provides a safety net
+///   against any mis-application bug in this code path.
+pub fn apply_block_transactions_assume_valid(
+    block: &Block,
+    utxo_set: &mut UtxoSet,
+) -> Result<(u64, Vec<(OutPoint, UtxoEntry)>), ValidationError> {
+    let header = &block.header;
+
+    let mut spent_utxos: Vec<(OutPoint, UtxoEntry)> = Vec::new();
+    let mut spent_utxos_bytes: usize = 0;
+
+    // Coinbase first — identical rollback handling to the validated path.
+    if let Err(e) = utxo_set.apply_transaction(&block.transactions[0], header.height) {
+        if let Err(undo_err) = utxo_set.undo_transaction(&block.transactions[0], &[]) {
+            return Err(ValidationError::StateCorrupted(format!(
+                "coinbase apply: {}; rollback also failed: {}",
+                e, undo_err
+            )));
+        }
+        return Err(ValidationError::StateCorrupted(format!(
+            "coinbase apply: {}",
+            e
+        )));
+    }
+    let mut applied_count: usize = 1;
+
+    let mut total_fees: u128 = 0;
+    for tx in block.transactions.iter().skip(1) {
+        // Snapshot spent UTXOs (parity with validated path) AND compute the
+        // input sum for fee derivation in a single pass.
+        let tx_spent_start = spent_utxos.len();
+        let mut input_sum: u128 = 0;
+        for input in &tx.inputs {
+            let outpoint = OutPoint::new(input.prev_tx_id, input.output_index);
+            let entry = match utxo_set.get(&outpoint) {
+                Some(e) => e.clone(),
+                None => {
+                    // Structural failure: input references a UTXO that
+                    // doesn't exist. apply_transaction would also catch
+                    // this; failing here avoids the extra mutation roundtrip.
+                    if let Err(undo_err) =
+                        undo_applied_transactions(block, utxo_set, applied_count, &spent_utxos)
+                    {
+                        return Err(ValidationError::StateCorrupted(format!(
+                            "missing input utxo {:?}: rollback failed: {}",
+                            outpoint, undo_err
+                        )));
+                    }
+                    return Err(ValidationError::StateCorrupted(format!(
+                        "missing input utxo {:?}",
+                        outpoint
+                    )));
+                }
+            };
+            input_sum = input_sum.saturating_add(entry.output.value as u128);
+            // Identical sizing math to the validated path so the cap behaves
+            // the same on identical inputs.
+            let entry_bytes = 53 + entry.output.serialize().map(|b| b.len()).unwrap_or(0);
+            spent_utxos_bytes = spent_utxos_bytes.saturating_add(entry_bytes);
+            if spent_utxos_bytes > MAX_SPENT_UTXOS_SIZE {
+                if let Err(undo_err) =
+                    undo_applied_transactions(block, utxo_set, applied_count, &spent_utxos)
+                {
+                    return Err(ValidationError::StateCorrupted(format!(
+                        "undo metadata overflow: rollback failed: {}",
+                        undo_err
+                    )));
+                }
+                return Err(ValidationError::BlockTooLarge {
+                    size: spent_utxos_bytes,
+                });
+            }
+            spent_utxos.push((outpoint, entry));
+        }
+
+        // Fee = sum(inputs) - sum(outputs). `checked_sub` guards a malformed
+        // historical block (corrupted on-disk row, etc.); the validated path
+        // would have caught this at import time.
+        let output_sum: u128 = tx.outputs.iter().map(|o| o.value as u128).sum();
+        let fee = match input_sum.checked_sub(output_sum) {
+            Some(f) => f,
+            None => {
+                if let Err(undo_err) =
+                    undo_applied_transactions(block, utxo_set, applied_count, &spent_utxos)
+                {
+                    return Err(ValidationError::StateCorrupted(format!(
+                        "outputs exceed inputs: rollback failed: {}",
+                        undo_err
+                    )));
+                }
+                return Err(ValidationError::ValueOverflow);
+            }
+        };
+        total_fees = total_fees.saturating_add(fee);
+
+        if let Err(e) = utxo_set.apply_transaction(tx, header.height) {
+            // Same partial-rollback dance as validated path.
+            let tx_spent: Vec<_> = spent_utxos[tx_spent_start..].to_vec();
+            if let Err(partial_err) = utxo_set.undo_partial_transaction(tx, &tx_spent) {
+                return Err(ValidationError::StateCorrupted(format!(
+                    "tx apply: {}: partial undo failed: {}",
+                    e, partial_err
+                )));
+            }
+            if let Err(undo_err) =
+                undo_applied_transactions(block, utxo_set, applied_count, &spent_utxos)
+            {
+                return Err(ValidationError::StateCorrupted(format!(
+                    "tx apply: {}: rollback failed: {}",
+                    e, undo_err
+                )));
+            }
+            return Err(ValidationError::StateCorrupted(format!("tx apply: {}", e)));
+        }
+        applied_count += 1;
+    }
+
+    if total_fees > u64::MAX as u128 {
+        if let Err(undo_err) =
+            undo_applied_transactions(block, utxo_set, applied_count, &spent_utxos)
+        {
+            return Err(ValidationError::StateCorrupted(format!(
+                "ValueOverflow: rollback failed: {}",
+                undo_err
+            )));
+        }
+        return Err(ValidationError::ValueOverflow);
+    }
+    let total_fees = total_fees as u64;
+
+    Ok((total_fees, spent_utxos))
+}
+
 /// Undo `applied_count` transactions from the front of `block.transactions`
 /// in reverse order. Restores spent UTXOs from `spent_utxos`.
 ///
@@ -1712,5 +1866,174 @@ mod tests {
         let root = compute_tx_root(std::slice::from_ref(&tx)).unwrap();
         // Single tx: root = wtx_id (witness-committed hash)
         assert_eq!(root, tx.wtx_id().unwrap());
+    }
+
+    // ---- apply_block_transactions_assume_valid coverage --------------------
+    //
+    // Goal: prove that the fast assume-valid path produces *exactly* the same
+    // UTXO state, fees, and spent_utxos as the validated path on inputs both
+    // agree on (any input the validated path would reject is out of scope —
+    // assume-valid is only used on blocks we previously imported and trust).
+
+    use crate::consensus::reward::block_reward;
+    use crate::types::transaction::{TxInput, TxOutput, TxWitness};
+
+    fn coinbase_tx(height: u64, pubkey: &[u8; 32]) -> Transaction {
+        Transaction {
+            inputs: vec![TxInput {
+                prev_tx_id: Hash256::ZERO,
+                output_index: height as u32,
+            }],
+            outputs: vec![TxOutput::new_p2pkh(block_reward(height), pubkey)],
+            witnesses: vec![TxWitness {
+                witness: vec![],
+                redeemer: None,
+            }],
+        }
+    }
+
+    fn make_block_with(height: u64, transactions: Vec<Transaction>, state_root: Hash256) -> Block {
+        Block {
+            header: BlockHeader {
+                version: 1,
+                height,
+                prev_block_id: Hash256::ZERO,
+                timestamp: 1_700_000_000 + height,
+                difficulty_target: Hash256([0xff; 32]),
+                nonce: 0,
+                tx_root: compute_tx_root(&transactions).unwrap(),
+                state_root,
+            },
+            transactions,
+        }
+    }
+
+    #[test]
+    fn apply_assume_valid_matches_validated_for_coinbase_only_block() {
+        // Coinbase-only block: the validated path skips validate_transaction
+        // entirely (loop starts from index 1), so both paths exercise only
+        // the apply machinery. Outputs must be byte-identical.
+        let pubkey = [0xaa; 32];
+        let mut utxo_a = UtxoSet::new();
+        let mut utxo_b = UtxoSet::new();
+
+        let cb = coinbase_tx(1, &pubkey);
+        let mut tmp = UtxoSet::new();
+        tmp.apply_transaction(&cb, 1).unwrap();
+        let expected_root = tmp.state_root();
+        let block = make_block_with(1, vec![cb], expected_root);
+
+        let (fees_v, spent_v) =
+            validate_and_apply_block_transactions_atomic(&block, &mut utxo_a).unwrap();
+        let (fees_a, spent_a) = apply_block_transactions_assume_valid(&block, &mut utxo_b).unwrap();
+
+        assert_eq!(fees_v, 0);
+        assert_eq!(fees_a, fees_v, "fees must match validated path");
+        assert_eq!(spent_a, spent_v, "spent_utxos must match validated path");
+        assert_eq!(
+            utxo_a.state_root(),
+            utxo_b.state_root(),
+            "post-apply UTXO state_root must match"
+        );
+    }
+
+    #[test]
+    fn apply_assume_valid_advances_utxo_set_through_spend() {
+        // Pre-fund a wallet via a coinbase, then a spend tx redirects its
+        // value to a different pubkey. assume-valid does not check the
+        // (empty) witness signature; it must still mutate state correctly.
+        let pubkey_a = [0xaa; 32];
+        let pubkey_b = [0xbb; 32];
+
+        let mut utxo = UtxoSet::new();
+        let cb_height = 1;
+        let cb = coinbase_tx(cb_height, &pubkey_a);
+        let cb_tx_id = cb.tx_id().unwrap();
+        utxo.apply_transaction(&cb, cb_height).unwrap();
+
+        // Spending tx burns 100 (the fee), forwards the rest to pubkey_b.
+        let reward = block_reward(cb_height);
+        let fee_amount = 100u64;
+        let spend_value = reward - fee_amount;
+        let spend = Transaction {
+            inputs: vec![TxInput {
+                prev_tx_id: cb_tx_id,
+                output_index: 0,
+            }],
+            outputs: vec![TxOutput::new_p2pkh(spend_value, &pubkey_b)],
+            witnesses: vec![TxWitness {
+                witness: vec![],
+                redeemer: None,
+            }],
+        };
+        // Coinbase of the next block collects (block_reward + fees).
+        let next_height = cb_height + 1;
+        let cb_next = Transaction {
+            inputs: vec![TxInput {
+                prev_tx_id: Hash256::ZERO,
+                output_index: next_height as u32,
+            }],
+            outputs: vec![TxOutput::new_p2pkh(
+                block_reward(next_height) + fee_amount,
+                &pubkey_a,
+            )],
+            witnesses: vec![TxWitness {
+                witness: vec![],
+                redeemer: None,
+            }],
+        };
+        let block = make_block_with(next_height, vec![cb_next, spend], Hash256::ZERO);
+
+        let (fees, spent) = apply_block_transactions_assume_valid(&block, &mut utxo).unwrap();
+
+        assert_eq!(fees, fee_amount);
+        assert_eq!(spent.len(), 1, "exactly one input consumed");
+        // Spent UTXO was the coinbase output.
+        assert_eq!(spent[0].0.tx_id, cb_tx_id);
+        assert_eq!(spent[0].1.output.value, reward);
+        // Original coinbase output is gone; new p2pkh-to-b is present.
+        assert!(utxo.get(&OutPoint::new(cb_tx_id, 0)).is_none());
+        let spent_tx_id = block.transactions[1].tx_id().unwrap();
+        let new_output = utxo.get(&OutPoint::new(spent_tx_id, 0)).unwrap();
+        assert_eq!(new_output.output.value, spend_value);
+    }
+
+    #[test]
+    fn apply_assume_valid_rejects_missing_input_and_rolls_back() {
+        // A non-coinbase tx references a UTXO that doesn't exist. assume-valid
+        // must return Err and leave the UTXO set in its pre-call state (the
+        // coinbase from THIS block must also be rolled back).
+        let pubkey = [0xaa; 32];
+        let mut utxo = UtxoSet::new();
+        let pre_root = utxo.state_root();
+        let pre_len = utxo.len();
+
+        let cb = coinbase_tx(5, &pubkey);
+        let bogus_spend = Transaction {
+            inputs: vec![TxInput {
+                prev_tx_id: Hash256([0xde; 32]), // points at nothing
+                output_index: 0,
+            }],
+            outputs: vec![TxOutput::new_p2pkh(1, &pubkey)],
+            witnesses: vec![TxWitness {
+                witness: vec![],
+                redeemer: None,
+            }],
+        };
+        let block = make_block_with(5, vec![cb, bogus_spend], Hash256::ZERO);
+
+        let err = apply_block_transactions_assume_valid(&block, &mut utxo).unwrap_err();
+        // Either flavour is acceptable — both indicate structural rejection.
+        assert!(
+            matches!(err, ValidationError::StateCorrupted(_)),
+            "expected StateCorrupted, got {:?}",
+            err
+        );
+        assert_eq!(
+            utxo.state_root(),
+            pre_root,
+            "UTXO state must be rolled back"
+        );
+        assert_eq!(utxo.len(), pre_len);
     }
 }

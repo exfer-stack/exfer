@@ -27,7 +27,9 @@ use chain::state::UtxoSet;
 use chain::storage::ChainStorage;
 use clap::{Parser, Subcommand};
 use consensus::difficulty::{add_work, expected_difficulty, work_from_target};
-use consensus::validation::validate_and_apply_block_transactions_atomic;
+use consensus::validation::{
+    apply_block_transactions_assume_valid, validate_and_apply_block_transactions_atomic,
+};
 use consensus::validation::{
     median_time_past, validate_block_header, validate_block_header_skip_pow,
 };
@@ -3018,18 +3020,32 @@ fn replay_chain(
             }
         }
 
-        // Full transaction validation with automatic rollback on failure.
+        // Apply the block to the UTXO set. Two paths:
+        //
+        // - If the assume-valid checkpoint is proven AND this block is at or
+        //   below `ASSUME_VALID_HEIGHT`, skip signature/script validation —
+        //   the block was validated when first imported and the downstream
+        //   per-block state-root check still detects mis-application.
+        //
+        // - Otherwise, full validation as before.
+        //
         // `spent_utxos` was historically re-persisted here; it's already on
-        // disk from the original commit (see below), so the value is only
-        // used for the in-memory state mutation that `validate_and_apply_*`
-        // performs internally.
-        let (_fees, _spent_utxos) = validate_and_apply_block_transactions_atomic(&block, utxo_set)
-            .map_err(|e| {
-                format!(
-                    "block transaction validation failed at height {}: {:?}",
-                    block.header.height, e
-                )
-            })?;
+        // disk from the original commit (see NOTE below), so the value is
+        // only used for the in-memory mutation each path performs.
+        let skip_tx_validation = assume_valid_proven && height <= types::ASSUME_VALID_HEIGHT;
+        let apply_result = if skip_tx_validation {
+            apply_block_transactions_assume_valid(&block, utxo_set)
+        } else {
+            validate_and_apply_block_transactions_atomic(&block, utxo_set)
+        };
+        let (_fees, _spent_utxos) = apply_result.map_err(|e| {
+            format!(
+                "block transaction {} failed at height {}: {:?}",
+                if skip_tx_validation { "apply" } else { "validation" },
+                block.header.height,
+                e
+            )
+        })?;
 
         // TX indexing during replay is deferred — commit_block_atomic and
         // commit_reorg_atomic index new blocks as they arrive. Doing per-block
