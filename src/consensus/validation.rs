@@ -499,28 +499,61 @@ pub fn validate_transaction(
     let script_context = build_script_context(tx, utxo_set, current_height)?;
 
     // --- Pass 2: Expensive checks (signature verification, script evaluation) ---
+    //
+    // Per-input verification is embarrassingly parallel: each input's signature /
+    // script depends only on its own witness, its own UTXO, and the read-only
+    // `sig_message` / `script_context`. We run them concurrently via rayon and
+    // collect ALL results (no short-circuit) so that error reporting stays
+    // deterministic — the lowest input index wins, matching the sequential
+    // behaviour even when multiple inputs would fail.
+    //
+    // For Phase 1 (Ed25519 signature verify), this is the dominant CPU cost
+    // post-checkpoint replay; parallelising it scales above-checkpoint replay
+    // throughput approximately linearly with core count up to N inputs.
+
+    use rayon::prelude::*;
+
+    let per_input: Vec<Result<(u128, u128), ValidationError>> = (0..input_utxos.len())
+        .into_par_iter()
+        .map(|idx| {
+            let input_utxo = &input_utxos[idx];
+            let witness = &tx.witnesses[idx];
+
+            if is_phase1_script(&input_utxo.output.script) {
+                // Phase 1: 32-byte pubkey hash — validate with old signature method
+                validate_phase1_input(idx, witness, &input_utxo.output, &sig_message)?;
+                // Data-proportional cost: base + ceil_div(sig_message_bytes, 64) × 8
+                let sig_msg_cost = (sig_message.len() as u64).div_ceil(64) * 8;
+                let script_cost = PHASE1_SCRIPT_EVAL_COST as u128 + sig_msg_cost as u128;
+                Ok((script_cost, 0u128))
+            } else {
+                // Phase 2+: full script evaluation (returns actual cost)
+                let script_cost =
+                    validate_script_input(idx, witness, &input_utxo.output, &script_context)?;
+                // Script validation cost: deserialization + canonicalization + typecheck + cost analysis
+                let script_bytes = input_utxo.output.script.len() as u64;
+                let validation_cost = (script_bytes.div_ceil(64) * 10) as u128;
+                Ok((script_cost as u128, validation_cost))
+            }
+        })
+        .collect();
+
+    // Propagate the lowest-index error (deterministic regardless of which
+    // worker thread happened to finish first).
+    for r in &per_input {
+        if let Err(e) = r {
+            return Err(e.clone());
+        }
+    }
+
+    // Sum costs in original index order. Addition is commutative so order
+    // doesn't matter mathematically, but the loop keeps the data-flow obvious.
     let mut total_script_cost: u128 = 0;
     let mut total_script_validation_cost: u128 = 0;
-
-    for (idx, input_utxo) in input_utxos.iter().enumerate() {
-        let witness = &tx.witnesses[idx];
-
-        // Rule 5: Script validation — Phase 1 backward compat or Phase 2+ script eval
-        if is_phase1_script(&input_utxo.output.script) {
-            // Phase 1: 32-byte pubkey hash — validate with old signature method
-            validate_phase1_input(idx, witness, &input_utxo.output, &sig_message)?;
-            // Data-proportional cost: base + ceil_div(sig_message_bytes, 64) × 8
-            let sig_msg_cost = (sig_message.len() as u64).div_ceil(64) * 8;
-            total_script_cost += PHASE1_SCRIPT_EVAL_COST as u128 + sig_msg_cost as u128;
-        } else {
-            // Phase 2+: full script evaluation (returns actual cost)
-            let script_cost =
-                validate_script_input(idx, witness, &input_utxo.output, &script_context)?;
-            total_script_cost += script_cost as u128;
-            // Script validation cost: deserialization + canonicalization + typecheck + cost analysis
-            let script_bytes = input_utxo.output.script.len() as u64;
-            total_script_validation_cost += (script_bytes.div_ceil(64) * 10) as u128;
-        }
+    for r in per_input {
+        let (sc, vc) = r.expect("err case already returned above");
+        total_script_cost += sc;
+        total_script_validation_cost += vc;
     }
 
     // Rule 13: Per-transaction script budget cap
@@ -2222,5 +2255,105 @@ mod tests {
             utxo_v.state_root(),
             "post-apply state_root must match"
         );
+    }
+
+    /// Determinism: when multiple inputs would fail, `validate_transaction`
+    /// returns the error for the LOWEST input index every time, regardless of
+    /// which rayon worker thread happens to detect a failure first. This was a
+    /// trivially-true property of the sequential `for idx ...?` early-return
+    /// version. Parallelizing the loop reintroduces the risk, so we pin it
+    /// down here.
+    ///
+    /// Setup: a tx with 4 inputs all spending pre-funded coinbases. Inputs 0
+    /// and 1 carry valid signatures. Inputs 2 and 3 carry obviously-wrong
+    /// signatures (wrong key for the pubkey hash). Run validation 200 times
+    /// and assert the returned error always carries `input_index == 2`.
+    #[test]
+    fn validate_transaction_returns_lowest_index_error_under_parallel_verify() {
+        use crate::genesis::genesis_block;
+
+        // 4 distinct keys; the first two will sign correctly, the last two
+        // will sign with a *different* key than the pubkey_hash demands.
+        let signer_for_input: Vec<SigningKey> = (0..4)
+            .map(|i| signing_key_from_seed(0xa0 + i as u8))
+            .collect();
+        let pubkey_for_input: Vec<[u8; 32]> = signer_for_input
+            .iter()
+            .map(|s| s.verifying_key().to_bytes())
+            .collect();
+        // The bad-signer keys are *different* keys whose pubkey hash will
+        // not match the corresponding input's UTXO script.
+        let bad_signer = signing_key_from_seed(0xff);
+
+        // Seed the UTXO set with 4 pre-funded coinbases, one per input.
+        let mut utxo = UtxoSet::new();
+        let mut funding_tx_ids = Vec::with_capacity(4);
+        for (i, pk) in pubkey_for_input.iter().enumerate() {
+            // Use distinct heights so each coinbase has a unique tx_id.
+            let cb = coinbase_tx((i + 1) as u64, pk);
+            funding_tx_ids.push(cb.tx_id().unwrap());
+            utxo.apply_transaction(&cb, (i + 1) as u64).unwrap();
+        }
+
+        // Build a 4-input spending tx. Witnesses filled in after.
+        let mut spend = Transaction {
+            inputs: (0..4)
+                .map(|i| TxInput {
+                    prev_tx_id: funding_tx_ids[i],
+                    output_index: 0,
+                })
+                .collect(),
+            outputs: vec![TxOutput::new_p2pkh(
+                // Sum of the four coinbase rewards minus a fee, paid out to
+                // an arbitrary new key.
+                (0..4).map(|i| block_reward((i + 1) as u64)).sum::<u64>() - 4000,
+                &[0x77; 32],
+            )],
+            witnesses: vec![
+                TxWitness {
+                    witness: vec![],
+                    redeemer: None,
+                };
+                4
+            ],
+        };
+        for i in 0..2 {
+            // Correctly-signed inputs 0 and 1.
+            spend.witnesses[i] = phase1_witness_for(&spend, &signer_for_input[i]);
+        }
+        for i in 2..4 {
+            // Wrong-key signatures for inputs 2 and 3. The signature itself
+            // is valid Ed25519 but `validate_phase1_input` computes
+            // `pubkey_hash_from_key(bad_signer.pubkey)` and compares it to
+            // the UTXO's script, which is the hash of `pubkey_for_input[i]`
+            // — mismatch, error returned.
+            let mut w = phase1_witness_for(&spend, &bad_signer);
+            // Override the pubkey in the witness so that the "PubkeyHashMismatch"
+            // path triggers (witness pubkey != UTXO script hash preimage).
+            w.witness[..32].copy_from_slice(&bad_signer.verifying_key().to_bytes());
+            spend.witnesses[i] = w;
+        }
+
+        let height = COINBASE_MATURITY + 10;
+
+        // Run many times — any of the 200 attempts that returns a *different*
+        // input index means the parallel path leaked non-determinism.
+        for run in 0..200 {
+            let err = validate_transaction(&spend, &utxo, height).unwrap_err();
+            let idx = match &err {
+                ValidationError::PubkeyHashMismatch { input_index } => *input_index,
+                ValidationError::SignatureInvalid { input_index } => *input_index,
+                ValidationError::WitnessInvalid { input_index, .. } => *input_index,
+                other => panic!("unexpected error variant on run {run}: {:?}", other),
+            };
+            assert_eq!(
+                idx, 2,
+                "run {run}: expected lowest-index error (input 2), got input {idx}: {:?}",
+                err
+            );
+        }
+
+        // Sanity: silence "genesis_block unused" warning if cfg drops it.
+        let _ = genesis_block;
     }
 }
