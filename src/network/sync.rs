@@ -8906,15 +8906,23 @@ mod stage_a_tests {
     #[test]
     fn stage_a_n_matches_spec() {
         // Round-6 correction: N = ceil((ASSUME_VALID_HEIGHT + 1) / MAX_GETBLOCKS_ITEMS).
-        // For ASSUME_VALID_HEIGHT = 302,400 and MAX_GETBLOCKS_ITEMS = 64,
-        // N must be 4,726 so that request 4,725 delivers the anchor at height
-        // 302,400. Earlier specs used N = 4,725 and missed the anchor.
+        // Earlier specs used N = floor(...) and missed the anchor when
+        // ASSUME_VALID_HEIGHT was a multiple of MAX_GETBLOCKS_ITEMS.
         let n = (ASSUME_VALID_HEIGHT + 1 + MAX_GETBLOCKS_ITEMS as u64 - 1)
             / MAX_GETBLOCKS_ITEMS as u64;
-        assert_eq!(n, 4_726, "N must equal 4,726 (round-6 correction)");
+        let expected_n = (ASSUME_VALID_HEIGHT + 1).div_ceil(MAX_GETBLOCKS_ITEMS as u64);
+        assert_eq!(n, expected_n, "N must equal the ceil-div formula");
 
-        // Request 4,725 asks for start_height = 4725 * 64 = 302,400.
+        // The last request must include the anchor block in its range.
+        // start = (n-1) * 64; that request covers heights [start, start + 64).
         let last_request_start = (n - 1) * MAX_GETBLOCKS_ITEMS as u64;
-        assert_eq!(last_request_start, ASSUME_VALID_HEIGHT);
+        let last_request_end_exclusive = last_request_start + MAX_GETBLOCKS_ITEMS as u64;
+        assert!(
+            last_request_start <= ASSUME_VALID_HEIGHT
+                && last_request_end_exclusive > ASSUME_VALID_HEIGHT,
+            "last request [{last_request_start}, {last_request_end_exclusive}) \
+             must contain ASSUME_VALID_HEIGHT = {}",
+            ASSUME_VALID_HEIGHT
+        );
     }
 }

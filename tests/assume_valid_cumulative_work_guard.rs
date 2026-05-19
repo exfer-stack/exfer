@@ -90,11 +90,13 @@ fn assume_valid_constants_are_internally_consistent() {
 /// whenever the checkpoint height changes, per the v1.7.0 multi-source
 /// ceremony (see docs/v1.7.0-brief.md Change 1).
 ///
-/// The 71 entries below were captured from the canonical chain on 2026-04-19
+/// The 116 entries below were captured from the canonical chain on 2026-05-19
 /// via RPC against TWO independent canonical nodes (S2 = 82.221.100.201 and
 /// S3 = 89.127.232.155), requiring byte-exact agreement on each entry. Each
 /// entry is the `difficulty_target` hex at the given retarget-window start
-/// height.
+/// height. ASSUME_VALID_HEIGHT (500000) is *inside* the last retarget window
+/// (496800..501120); the recomputation loop's terminal-segment branch handles
+/// the partial 3201-block tail without needing a separate fixture entry.
 #[test]
 fn assume_valid_cumulative_work_matches_fixture_recomputation() {
     use exfer::consensus::difficulty::work_from_target;
@@ -102,7 +104,9 @@ fn assume_valid_cumulative_work_matches_fixture_recomputation() {
     use exfer::types::RETARGET_WINDOW;
 
     // (window_start_height, difficulty_target_hex_big_endian)
-    // 70 full retarget windows (4320 blocks each) + terminal checkpoint window.
+    // 115 full retarget windows (4320 blocks each) + 1 partial terminal
+    // window (heights 496800..=500000 = 3201 blocks); the partial window
+    // is handled by the recomputation loop, not as a separate fixture entry.
     const RETARGET_BOUNDARY_TARGETS: &[(u64, &str)] = &[
         (0, "0100000000000000000000000000000000000000000000000000000000000000"),
         (4320, "0314ef6a58fb086db9e454d4dc72b47f820e88a2d5b0e1e6b3c96be38065aa3e"),
@@ -175,6 +179,55 @@ fn assume_valid_cumulative_work_matches_fixture_recomputation() {
         (293760, "0001090b8af9e565625fc62049bc4f9c2619dbc3eaaec7f7368703f45ed2a620"),
         (298080, "0000ee9d3d982429e7d226ae0fcf9152dcfcd8138680dd6eca11443ba361cb0b"),
         (302400, "0000db6358852f4c2ad9d10e2a8382c4ecf7a52d46e9b55d1714e9db3266e4f1"),
+        (306720, "0000d20572a970a2cf0e8a48c6636fbe307c5bc6427f90d65c06c76d741b10bf"),
+        (311040, "0000aba3c72f01312f236e9e3c658c3141a85c86118f962b0dc72f5a31164c08"),
+        (315360, "000086766015ea8ef0add5f263a71936e335cd504ff7109c5d367a1f7271576b"),
+        (319680, "000065dc345feeed67133efde7947d91241cb97d3bd4632239803bd149955777"),
+        (324000, "0000499b36625dffa9157e9ac9e69713c41720bda902ec0f303fcc637d7c6532"),
+        (328320, "000037d2902c134e384dea638cac3d86cf8ac0d6f6ee36233a5febd35d98d036"),
+        (332640, "000026a0e93063665e9e8b9e0eb3200f8a0579eb9687daeeca9e6d6603efa91a"),
+        (336960, "00001aae6c68bd625d734e7ff95e014defd444f1889c0cda78e9daa2e7de3cde"),
+        (341280, "00001578ead587bb34385195a332ec7b67a5b4eac786400b9c2a63193a6aaae5"),
+        (345600, "0000124aa00c9d7294364851ff1d85a7719a5a8d6a27835101814c098aa30f8b"),
+        (349920, "000010d4cbb93e00a62283a6f4c408b1a19a072b5c7cc5241b3750cd543a8c9c"),
+        (354240, "00000ce5482523899571b7a92a506561152f024ad0677d979f0a8ec33a7e6b20"),
+        (358560, "000009c90b9c87f08533edeab4b934b56868aba84012b00c59737daf4fe26024"),
+        (362880, "000008f9de04c18c595351213b5baf0d22f5b0a11aaef966e7a26a267631cf32"),
+        (367200, "000008437c2a3dfcce2ff4e61861d07b22cb007c9bb0763eaba9e3d44a99e003"),
+        (371520, "00000755aec9164d01568bdec8596d530946e20dfc684211de6d731e05485374"),
+        (375840, "0000069d9c1f27180480a23e6f0701faf2d9f2fa8960f11c44a22a790372e506"),
+        (380160, "0000061b3a02333a7929247b991958c06b90be0aee69de222ec0d50cf2cb5894"),
+        (384480, "00000481822c4ccd9d64106deefc890853a3f1e2d7c1e151d4424daa8a4297d7"),
+        (388800, "000003831df3c38a84133a2663a752ecbc7b7ddc2c78dd0f9f9c0f8cb95b61f6"),
+        (393120, "0000039a6ece84fb3abdd6d5a5b81c3b7c147a12034df150c1350f89bc16cd79"),
+        (397440, "000003714c55ec997cd7d8c3de8594480da847944f437c0a6f9741cedb825cad"),
+        (401760, "0000032583736a414bf8acdfee64aedd2d1e5df23c5508f27525246d928a675d"),
+        (406080, "000002bb7c5047235d16be11d27b4a6093161292b8a0f9289b9accdbbdd080b3"),
+        (410400, "0000028d370576cb4c3e7f7b67df888954f8981880f1e3cdfd7c14d98ee2cb79"),
+        (414720, "00000245356242163ccab95ff03549cff0058e379691365097b7b4d43c299a6a"),
+        (419040, "00000227b281dbb5b6e3c1e2ea2b7e5816024f4f1b464a9bb3789cae4fc611d6"),
+        (423360, "000001fdfdb6fd46719d31b02ec4dd33ca5f5f2041f6804ce495c1432fc813fc"),
+        (427680, "000001b617770f96e2d2d027cc5f99781778db3efec0ee0a5c09c9bd63b52baf"),
+        (432000, "0000015ecc4436af7865da178bd593e3ed18f29be0a77abdbde2bb9903e33c25"),
+        (436320, "0000011e231699f3cbc3c79a95e6d55ceea02b11a807893439aee7c4d246da2b"),
+        (440640, "000001376967392f4b81e227d345b319d5a6048d683ef84791587e85ebe7751d"),
+        (444960, "0000012af01df9f62879b79b88024cda62a2ec99ffc7cc5f04ad80dd42987b35"),
+        (449280, "0000013c4f926966439a9318bebd24ce2ea307094106fa2703d2caf9e2a670b4"),
+        (453600, "00000113c80ca984b3e7eac94433d0ce516ad2dd0c46aac0b3966fcaba959854"),
+        (457920, "00000100a6abf07e11e4715c74d431aefeadd93b15b6da52be32f61a4515775b"),
+        (462240, "000000de21bef7fee9cfdbf1a40723a9c78f9d3baad8c17fd42179394dfa240b"),
+        (466560, "000000c60fdd21c2eda385fe38b14f193fe54a670cec89adf62a4b311473198e"),
+        (470880, "000000b6772f1a1213da05b83dd7a93defdaaf8c9983ee240860b5001426344b"),
+        (475200, "000000ab2f813f2a084f98c72b42a73239856314e3b7efb80febc5046698d8eb"),
+        (479520, "000000953220a94b0ac39fa2cf0bd5a24586b8e0a76860f585c2e8cbc362d8c5"),
+        (483840, "00000070466dfab2ded8ae7c2ac9b27a510e771dc7c66c20382b7b5ee8604e08"),
+        (488160, "00000067f831facb653602d82929e9d2f337beea783dabd8f5f4b2a4f8acdfc2"),
+        (492480, "0000005c5c9908ff22470cce0403e6168c5c26adbf6c36ee9d7df7ab0e70acca"),
+        (496800, "000000537b9024dafd50b5a0c2465c3574785f9bc6bebd5e9af711602b44f256"),
+        // ASSUME_VALID_HEIGHT (500000) sits inside this same retarget window;
+        // the recomputation loop's terminal-segment branch handles the partial
+        // 3201-block window (496800..=500000) automatically — a separate
+        // tuple at 500000 would double-count the checkpoint block.
     ];
 
     // 256-bit accumulator via saturating u8 arithmetic.
@@ -217,9 +270,12 @@ fn assume_valid_cumulative_work_matches_fixture_recomputation() {
         expected_acc = add_big(&expected_acc, &segment_work);
     }
 
-    // Also sanity-check the final retarget-window start maps to the correct
-    // checkpoint height alignment. `ASSUME_VALID_HEIGHT / RETARGET_WINDOW = 30`
-    // whole windows at the time of this fixture; terminal window starts at 129600.
+    // Sanity-check: the fixture's last entry must be the last retarget
+    // boundary ≤ ASSUME_VALID_HEIGHT, computed as
+    // `(ASSUME_VALID_HEIGHT / RETARGET_WINDOW) * RETARGET_WINDOW`. If
+    // ASSUME_VALID_HEIGHT itself happens to land on a boundary they're
+    // equal; otherwise the partial terminal window is implicit (the
+    // recomputation loop carries it inside the same target).
     let expected_terminal_start = (ASSUME_VALID_HEIGHT / RETARGET_WINDOW) * RETARGET_WINDOW;
     assert_eq!(
         RETARGET_BOUNDARY_TARGETS.last().unwrap().0,
