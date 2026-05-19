@@ -27,7 +27,9 @@ use chain::state::UtxoSet;
 use chain::storage::ChainStorage;
 use clap::{Parser, Subcommand};
 use consensus::difficulty::{add_work, expected_difficulty, work_from_target};
-use consensus::validation::validate_and_apply_block_transactions_atomic;
+use consensus::validation::{
+    apply_block_transactions_assume_valid, validate_and_apply_block_transactions_atomic,
+};
 use consensus::validation::{
     median_time_past, validate_block_header, validate_block_header_skip_pow,
 };
@@ -3018,12 +3020,30 @@ fn replay_chain(
             }
         }
 
-        // Full transaction validation with automatic rollback on failure
-        let (_fees, spent_utxos) = validate_and_apply_block_transactions_atomic(&block, utxo_set)
-            .map_err(|e| {
+        // Apply the block to the UTXO set. Two paths:
+        //
+        // - If the assume-valid checkpoint is proven AND this block is at or
+        //   below `ASSUME_VALID_HEIGHT`, skip signature/script validation —
+        //   the block was validated when first imported and the downstream
+        //   per-block state-root check still detects mis-application.
+        //
+        // - Otherwise, full validation as before.
+        //
+        // `spent_utxos` was historically re-persisted here; it's already on
+        // disk from the original commit (see NOTE below), so the value is
+        // only used for the in-memory mutation each path performs.
+        let skip_tx_validation = assume_valid_proven && height <= types::ASSUME_VALID_HEIGHT;
+        let apply_result = if skip_tx_validation {
+            apply_block_transactions_assume_valid(&block, utxo_set)
+        } else {
+            validate_and_apply_block_transactions_atomic(&block, utxo_set)
+        };
+        let (_fees, _spent_utxos) = apply_result.map_err(|e| {
             format!(
-                "block transaction validation failed at height {}: {:?}",
-                block.header.height, e
+                "block transaction {} failed at height {}: {:?}",
+                if skip_tx_validation { "apply" } else { "validation" },
+                block.header.height,
+                e
             )
         })?;
 
@@ -3041,21 +3061,20 @@ fn replay_chain(
             ));
         }
 
-        // Persist spent-UTXO metadata so reorg undo works
-        storage
-            .store_spent_utxos(&block_id, &spent_utxos)
-            .map_err(|e| {
-                format!(
-                    "failed to store spent UTXOs at height {}: {}",
-                    block.header.height, e
-                )
-            })?;
-
+        // NOTE: `store_spent_utxos` and `put_cumulative_work` were called
+        // here per-block in earlier versions, but both are *already*
+        // persisted atomically by `commit_block_atomic` /
+        // `commit_reorg_atomic` (chain/storage.rs) when the block first
+        // arrives. Re-writing them on every replay was duplicate I/O —
+        // 2 extra redb write transactions per block, each with its own
+        // fsync. At chain heights in the 100k+ range this dominated
+        // replay wall time on slow / network-attached storage.
+        //
+        // Atomicity invariant: if `storage.get_block(&block_id)` succeeded
+        // above, then the commit transaction that wrote the block also
+        // wrote spent_utxos + cumulative_work, so they are present.
         let block_work = work_from_target(&block.header.difficulty_target);
         cumulative_work = add_work(&cumulative_work, &block_work);
-        storage
-            .put_cumulative_work(&block_id, &cumulative_work)
-            .map_err(|e| format!("failed to store work at height {}: {}", height, e))?;
 
         // Progress logging every 1000 blocks
         if (height + 1) % 1000 == 0 || height == tip_height {

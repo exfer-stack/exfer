@@ -221,6 +221,13 @@ impl ChainStorage {
     }
 
     /// Store cumulative work for a block.
+    ///
+    /// Note: no production caller as of the chain-replay cleanup —
+    /// `commit_block_atomic` writes WORK_TABLE inline in the same atomic
+    /// transaction as the block itself. This standalone method is kept
+    /// because integration test fixtures (`tests/audit_fix_tests_*`)
+    /// construct chain state piece by piece and use it directly.
+    #[allow(dead_code)]
     pub fn put_cumulative_work(
         &self,
         block_id: &Hash256,
@@ -437,6 +444,13 @@ impl ChainStorage {
     }
 
     /// Store the UTXOs spent by a block (for undo during reorg).
+    ///
+    /// Note: no production caller as of the chain-replay cleanup —
+    /// `commit_block_atomic` / `commit_reorg_atomic` write SPENT_UTXOS_TABLE
+    /// inline in their atomic transactions. This standalone method is kept
+    /// because integration test fixtures (`tests/audit_fix_tests_*`)
+    /// construct chain state piece by piece and use it directly.
+    #[allow(dead_code)]
     pub fn store_spent_utxos(
         &self,
         block_id: &Hash256,
