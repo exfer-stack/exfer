@@ -1,5 +1,5 @@
 use crate::chain::fork_choice::{is_better_chain, ChainTip};
-use crate::chain::state::{UtxoEntry, UtxoSet};
+use crate::chain::state::{UtxoEntry, UtxoMutation, UtxoSet};
 use crate::chain::storage::ChainStorage;
 use crate::consensus::difficulty::expected_difficulty;
 use crate::consensus::validation::{
@@ -2452,9 +2452,11 @@ impl Node {
             if block.header.prev_block_id == current_tip.block_id {
                 // Extends current tip — validate and apply in-place (no clone).
                 // On failure the atomic function rolls back automatically.
-                // Spent UTXOs are collected incrementally during apply (captures
-                // intra-block dependency spends that don't exist pre-block).
-                let (_total_fees, spent_utxos) =
+                // The returned mutation log is the single source of truth
+                // (commit 3 wires it into UTXOS_TABLE; commit 4 wires it into
+                // reorg-undo). Until those land, we derive the legacy
+                // `(OutPoint, UtxoEntry)` slice for the existing consumers.
+                let (_total_fees, _mutations) =
                     validate_and_apply_block_transactions_atomic(&block, &mut utxo_set).map_err(
                         |e| match e {
                             ValidationError::StateCorrupted(msg) => ProcessBlockError::Fatal(
@@ -2466,6 +2468,7 @@ impl Node {
                             )),
                         },
                     )?;
+                let spent_utxos = UtxoMutation::collect_spent_utxos(&_mutations);
 
                 // State root check (O(1) with incremental SMT)
                 let computed_state_root = utxo_set.state_root();
@@ -2709,13 +2712,17 @@ impl Node {
                             }
                         }
 
-                        // Validate and apply — spent UTXOs are collected
-                        // incrementally inside (captures intra-block spends).
+                        // Validate and apply — mutation log captures Insert
+                        // and Remove in apply order, including intra-block
+                        // dependency spends. Derive legacy spent_utxos until
+                        // commit 4 refactors undo + reorg consumers.
                         let spent_utxos = match validate_and_apply_block_transactions_atomic(
                             blk,
                             &mut utxo_set,
                         ) {
-                            Ok((_fees, spent)) => spent,
+                            Ok((_fees, mutations)) => {
+                                UtxoMutation::collect_spent_utxos(&mutations)
+                            }
                             Err(ValidationError::StateCorrupted(msg)) => {
                                 // Atomic apply hit state corruption — fatal
                                 break 'apply Some(ProcessBlockError::Fatal(format!(
