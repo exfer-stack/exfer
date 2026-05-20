@@ -2819,6 +2819,203 @@ fn sign_tx_with_wallet(
     w.signing_key_for_cli().sign(&sig_msg)
 }
 
+/// Phase 3a (issue #6) — fast boot path: cheap structural per-block walk
+/// over canonical metadata + bulk-load of the persisted UTXO snapshot +
+/// state-root cross-check. Falls through to [`replay_chain`] when the
+/// snapshot is missing, stale, or fails the cross-check, so this function
+/// is safe to make the default boot path.
+///
+/// What is preserved from `replay_chain`'s integrity checks:
+///   - Tip metadata presence + consistency with height-index / blocks table
+///   - Genesis hash match at h=0
+///   - Per-height: height-index → block resolution, parent linkage, full
+///     `validate_block_header_skip_pow` (covers version, height seq,
+///     prev-id, difficulty target, MTP, timestamp gap, block size,
+///     coinbase structure, tx-root, intra-block duplicate/double-spend).
+///   - Final tip/walk consistency.
+///
+/// What is dropped (replaced by the state_root cross-check + persisted
+/// UTXO snapshot):
+///   - Per-tx signature / script validation
+///   - UTXO state mutation during the walk
+///
+/// Empirical boot cost on a chain @ h=463,041 (bench/phase3a-bench branch,
+/// `src/bin/bench_phase3a.rs`, fly performance-2x): 10.52 s for the cheap
+/// walk; UTXO load + SMT rebuild adds ~17 s on top at 360k UTXOs. Compare
+/// to today's full replay at ~37 s on the same hardware.
+fn open_chain(
+    storage: &Arc<ChainStorage>,
+    utxo_set: &mut UtxoSet,
+    expected_genesis_id: &Hash256,
+    assume_valid: bool,
+) -> Result<ChainTip, String> {
+    // Bootstrap-from-empty / tip-missing remains entirely handled by
+    // replay_chain (genesis seeding lives in the caller path before us
+    // anyway; this branch covers any leftover edge case).
+    let tip_id = match storage
+        .get_tip()
+        .map_err(|e| format!("db error reading tip: {}", e))?
+    {
+        Some(id) => id,
+        None => {
+            return replay_chain(storage, utxo_set, expected_genesis_id, assume_valid);
+        }
+    };
+
+    // Snapshot marker must (a) exist + complete and (b) point at the
+    // current tip. Anything else → fall through to full replay.
+    let snapshot_tip = storage
+        .get_utxo_snapshot_tip()
+        .map_err(|e| format!("db error reading utxo snapshot marker: {}", e))?;
+    match snapshot_tip {
+        Some(id) if id == tip_id => {}
+        Some(stale) => {
+            info!(
+                "UTXO snapshot stale (snapshot_tip={} current_tip={}); falling through to full replay",
+                stale, tip_id
+            );
+            return replay_chain(storage, utxo_set, expected_genesis_id, assume_valid);
+        }
+        None => {
+            info!("UTXO snapshot missing or incomplete; falling through to full replay");
+            return replay_chain(storage, utxo_set, expected_genesis_id, assume_valid);
+        }
+    }
+
+    let tip_header = storage
+        .get_header(&tip_id)
+        .map_err(|e| format!("db error reading tip header: {}", e))?
+        .ok_or_else(|| format!("tip block header {} not found", tip_id))?;
+    let tip_height = tip_header.height;
+
+    // Assume-valid: same policy as replay_chain — skip PoW iff the
+    // checkpoint block is in storage at the expected hash.
+    let assume_valid_proven = assume_valid
+        && tip_height >= types::ASSUME_VALID_HEIGHT
+        && storage
+            .get_block_id_by_height(types::ASSUME_VALID_HEIGHT)
+            .ok()
+            .flatten()
+            .map(|id| id == Hash256(types::ASSUME_VALID_HASH))
+            .unwrap_or(false);
+
+    // -------- Cheap structural per-block walk --------
+    let mut prev_id = Hash256::ZERO;
+    let mut cumulative_work = [0u8; 32];
+    for height in 0..=tip_height {
+        let block_id = storage
+            .get_block_id_by_height(height)
+            .map_err(|e| format!("db error at height {}: {}", height, e))?
+            .ok_or_else(|| {
+                format!(
+                    "height index missing entry at height {} during open_chain walk",
+                    height
+                )
+            })?;
+        if height == 0 && block_id != *expected_genesis_id {
+            return Err(format!(
+                "height 0 block {} does not match expected genesis {}; database belongs to a different chain",
+                block_id, expected_genesis_id
+            ));
+        }
+        let block = storage
+            .get_block(&block_id)
+            .map_err(|e| format!("db error reading block at height {}: {}", height, e))?
+            .ok_or_else(|| {
+                format!(
+                    "canonical block {} at height {} missing during open_chain walk",
+                    block_id, height
+                )
+            })?;
+        if block.header.prev_block_id != prev_id {
+            return Err(format!(
+                "chain linkage broken at height {}: block prev_block_id {} != expected {}",
+                height, block.header.prev_block_id, prev_id
+            ));
+        }
+        if height > 0 {
+            let parent_header = storage
+                .get_header(&block.header.prev_block_id)
+                .map_err(|e| format!("db error reading parent header at height {}: {}", height, e))?
+                .ok_or_else(|| format!("parent header not found at height {}", height))?;
+            let ancestors = storage
+                .get_ancestor_timestamps(&block.header.prev_block_id, MTP_WINDOW)
+                .map_err(|e| {
+                    format!("db error reading ancestor timestamps at height {}: {}", height, e)
+                })?;
+            let target = consensus::difficulty::expected_difficulty(
+                storage,
+                &block.header.prev_block_id,
+                block.header.height,
+            )
+            .map_err(|e| format!("difficulty computation failed at height {}: {}", height, e))?;
+            let skip_pow =
+                assume_valid_proven && height <= types::ASSUME_VALID_HEIGHT;
+            let result = if skip_pow {
+                validate_block_header_skip_pow(
+                    &block,
+                    Some(&parent_header),
+                    &ancestors,
+                    &target,
+                    None,
+                )
+            } else {
+                validate_block_header(
+                    &block,
+                    Some(&parent_header),
+                    &ancestors,
+                    &target,
+                    None,
+                )
+            };
+            result.map_err(|e| {
+                format!("block header validation failed at height {}: {:?}", height, e)
+            })?;
+        }
+        let blk_work = consensus::difficulty::work_from_target(&block.header.difficulty_target);
+        cumulative_work = consensus::difficulty::add_work(&cumulative_work, &blk_work);
+        prev_id = block_id;
+    }
+    if prev_id != tip_id {
+        return Err(format!(
+            "open_chain/tip mismatch: last walked block {} != persisted tip {}; \
+             height index and tip metadata are inconsistent",
+            prev_id, tip_id
+        ));
+    }
+
+    // -------- Load persisted UTXO snapshot + state_root cross-check --------
+    let utxos = storage
+        .iter_utxos()
+        .map_err(|e| format!("failed to read UTXOS_TABLE: {}", e))?;
+    let utxo_count = utxos.len();
+    for (op, entry) in utxos {
+        utxo_set.insert(op, entry).map_err(|e| {
+            format!("failed to seed in-memory UtxoSet from snapshot: {:?}", e)
+        })?;
+    }
+    let computed_root = utxo_set.state_root();
+    if computed_root != tip_header.state_root {
+        return Err(format!(
+            "UTXO snapshot state_root {} does not match tip header state_root {}; \
+             on-disk snapshot is corrupt. Run with --rebuild-state to recover from \
+             a full chain replay.",
+            computed_root, tip_header.state_root
+        ));
+    }
+
+    info!(
+        "Opened chain from persisted UTXO snapshot: tip={} height={} utxos={}",
+        tip_id, tip_height, utxo_count
+    );
+
+    Ok(ChainTip {
+        block_id: tip_id,
+        height: tip_height,
+        cumulative_work,
+    })
+}
+
 /// Replay the canonical chain from genesis to tip, rebuilding the UTXO set
 /// and validating every block. Returns the chain tip on success.
 ///
@@ -3363,10 +3560,12 @@ async fn run_node(
         info!("Stored genesis block: {}", expected_genesis_id);
     }
 
-    // P1-5: Reconstruct state by replaying chain from genesis to tip
-    let tip = replay_chain(&storage, &mut utxo_set, &expected_genesis_id, assume_valid).map_err(|e| {
+    // Phase 3a — fast boot path: try the persisted UTXO snapshot + cheap
+    // structural walk; fall through to full replay if the snapshot is
+    // missing, stale, or fails the state_root cross-check.
+    let tip = open_chain(&storage, &mut utxo_set, &expected_genesis_id, assume_valid).map_err(|e| {
         format!(
-            "Chain replay failed: {e}. Database may be corrupt. Delete data directory and re-sync."
+            "Chain open failed: {e}. Database may be corrupt. Delete data directory and re-sync."
         )
     })?;
 
