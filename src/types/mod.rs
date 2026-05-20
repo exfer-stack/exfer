@@ -33,24 +33,38 @@ pub const BLOCK_HEADER_SIZE: usize = 156;
 
 /// Height at which the assume-valid checkpoint is verified.
 /// Blocks at or below this height skip Argon2id PoW during IBD/replay.
-pub const ASSUME_VALID_HEIGHT: u64 = 302_400;
+/// Combined with the tx-validation skip introduced in v1.10.2 (PR #3),
+/// this also lets replay skip per-input Ed25519 verification below the
+/// checkpoint — meaning every block in `0..=ASSUME_VALID_HEIGHT` is
+/// effectively free to replay. Raising the constant therefore makes a
+/// fresh cold-boot nearly instant for the entire pre-checkpoint range.
+pub const ASSUME_VALID_HEIGHT: u64 = 500_000;
 /// Block hash at ASSUME_VALID_HEIGHT. Verified exactly once during sync.
 pub const ASSUME_VALID_HASH: [u8; 32] = [
-    0x67, 0x3c, 0x2a, 0x1e, 0x9a, 0x94, 0x8e, 0xd5,
-    0x19, 0x15, 0x98, 0x08, 0xee, 0xb0, 0xbd, 0x94,
-    0x37, 0x3e, 0xc8, 0x3e, 0xe8, 0x57, 0x3b, 0xef,
-    0x20, 0xb5, 0x24, 0x5f, 0x5e, 0x6c, 0x32, 0x17,
+    0xdb, 0x1f, 0x9c, 0xa3, 0x6c, 0x3e, 0x12, 0xbf,
+    0x03, 0x01, 0xfb, 0x65, 0xea, 0x9c, 0xf2, 0x18,
+    0xa7, 0x53, 0xf3, 0xd8, 0x0f, 0x1a, 0x07, 0xb5,
+    0x9d, 0x6e, 0xa1, 0x32, 0x37, 0x32, 0x19, 0x40,
 ];
 /// Cumulative work at ASSUME_VALID_HEIGHT on the canonical chain. Used by v1.5.0
 /// Fix 2 cold-bootstrap subpath 2b to derive `verified_cumulative_work` without
 /// walking storage below the checkpoint anchor. Big-endian 256-bit integer.
 ///
-/// Value generated 2026-04-19 from the canonical chain by walking retarget
+/// Value regenerated 2026-05-19 from the canonical chain by walking retarget
 /// boundaries via RPC against TWO independent canonical nodes (S2 at
 /// 82.221.100.201 and S3 at 89.127.232.155), requiring byte-exact agreement
-/// on each of the 71 retarget-boundary targets, then summing
+/// on each of the 116 retarget-boundary targets (terminal partial window
+/// 496800..=500000 is implicit in the summation, not a separate fixture
+/// entry), then summing
 /// `work_from_target(difficulty_target) × window_blocks` across heights
-/// 0..=ASSUME_VALID_HEIGHT inclusive. Decimal: 3,839,137,688.
+/// 0..=ASSUME_VALID_HEIGHT inclusive. Decimal: 2,045,970,369,492.
+///
+/// **Regeneration tooling**: `tools/regen_assume_valid.py` mechanises this
+/// ceremony — pulls every retarget-boundary `difficulty_target` from BOTH
+/// reference nodes, aborts on any byte-mismatch, recomputes
+/// `Σ work × blocks`, and emits the Rust source ready to paste here.
+/// Sanity-tested by running against the previous checkpoint (`302_400`)
+/// and confirming byte-identical output to the in-tree values.
 ///
 /// **Release procedure:** regenerate alongside `ASSUME_VALID_HEIGHT` and
 /// `ASSUME_VALID_HASH` if any of them are changed. Multi-source verification
@@ -70,7 +84,7 @@ pub const ASSUME_VALID_CUMULATIVE_WORK: [u8; 32] = [
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0xe4, 0xd9, 0xf5, 0x98,
+    0x00, 0x00, 0x01, 0xdc, 0x5d, 0x56, 0x4b, 0xd4,
 ];
 
 // ── v1.5.0 Fix 2 — tip-validation constants ──
