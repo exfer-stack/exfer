@@ -1,6 +1,6 @@
 //! Phase 3a design benchmark — diagnostic only, do not ship.
 //!
-//! Measures three things on an existing chain.redb:
+//! Measures four things on an existing chain.redb:
 //!   Exp1 — cheap canonical-metadata walk (header + linkage + skip_pow validation).
 //!          This is the boot-time cost of the proposed open_chain integrity walk,
 //!          assuming UTXO is persisted (so no per-tx work).
@@ -8,6 +8,10 @@
 //!          Reports wall time + final utxo count + SMT stats + state root.
 //!   Exp3 — SMT-rebuild-from-iter (proxy for Phase 3b's open-time SMT cost
 //!          once UTXO is persisted but SMT is not).
+//!   Exp4 — A/B comparison: finalize the snapshot then time the actual
+//!          `open_chain` (Phase 3a fast path) on a fresh ChainStorage
+//!          handle. Headline number for the PR: open_chain wall-time vs
+//!          replay_chain wall-time (Exp2) on the same chain.
 //!
 //! Output is `tag=value` lines on stdout so the surrounding shell can grep
 //! cheaply. Progress and free-form notes go to stderr.
@@ -15,8 +19,10 @@
 //! Run: bench_phase3a <datadir>      (default: /data)
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Instant;
 
+use exfer::chain::open::open_chain;
 use exfer::chain::state::UtxoSet;
 use exfer::chain::storage::ChainStorage;
 use exfer::consensus::difficulty::expected_difficulty;
@@ -213,6 +219,58 @@ fn main() -> Result<(), String> {
         utxos.len() as f64 / exp3_elapsed.max(1e-9)
     );
     println!("exp3_root_matches_full_rebuild={}", fresh_root == final_root);
+
+    // ===== Experiment 4: end-to-end A/B vs Exp2 =====
+    // Persist the in-memory UtxoSet to UTXOS_TABLE via finalize_utxo_snapshot,
+    // then drop the storage handle, re-open ChainStorage from disk, and call
+    // open_chain. The open_chain wall-time is the headline Phase 3a number to
+    // compare against Exp2 (today's replay_chain cost on the same chain).
+    eprintln!("# Exp4: finalize snapshot + time open_chain (Phase 3a A/B vs Exp2)");
+    let exp4_finalize_start = Instant::now();
+    storage
+        .finalize_utxo_snapshot(&utxo_set, &tip_id)
+        .map_err(|e| format!("finalize_utxo_snapshot failed: {}", e))?;
+    let exp4_finalize_secs = exp4_finalize_start.elapsed().as_secs_f64();
+    println!("exp4_finalize_secs={:.4}", exp4_finalize_secs);
+
+    // Drop the in-memory UtxoSet and the storage handle so the re-open
+    // measurement is honest (cold redb file handle, no warm page cache from
+    // the test process's prior reads).
+    drop(utxo_set);
+    drop(storage);
+
+    let storage2 = Arc::new(ChainStorage::open(&db_path).map_err(|e| e.to_string())?);
+    let mut utxo_set2 = UtxoSet::new();
+    let expected_genesis_id = genesis_block().header.block_id();
+    let exp4_open_start = Instant::now();
+    let tip3a = open_chain(
+        &storage2,
+        &mut utxo_set2,
+        &expected_genesis_id,
+        true,  // assume_valid: same default as production
+        false, // auto_migrate: marker already set, must not re-run replay
+    )
+    .map_err(|e| format!("open_chain failed: {}", e))?;
+    let exp4_open_secs = exp4_open_start.elapsed().as_secs_f64();
+    println!("exp4_open_chain_secs={:.4}", exp4_open_secs);
+    println!("exp4_open_chain_tip_height={}", tip3a.height);
+    println!(
+        "exp4_open_chain_state_root_matches_exp2={}",
+        utxo_set2.state_root() == final_root
+    );
+    println!(
+        "exp4_open_chain_utxo_count_matches_exp2={}",
+        utxo_set2.len() == fresh.len()
+    );
+
+    // Headline: replay (Exp2) vs Phase 3a open (Exp4). Speedup is reported
+    // as the ratio of wall times. The finalize cost (Exp4 finalize) is a
+    // one-time migration cost paid on the first boot after upgrade, NOT
+    // every boot.
+    println!(
+        "exp4_speedup_vs_exp2={:.2}x",
+        exp2_elapsed / exp4_open_secs.max(1e-9)
+    );
 
     eprintln!("# DONE");
     Ok(())
