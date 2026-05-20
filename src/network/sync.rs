@@ -2452,11 +2452,12 @@ impl Node {
             if block.header.prev_block_id == current_tip.block_id {
                 // Extends current tip — validate and apply in-place (no clone).
                 // On failure the atomic function rolls back automatically.
-                // The returned mutation log is the single source of truth
-                // (commit 3 wires it into UTXOS_TABLE; commit 4 wires it into
-                // reorg-undo). Until those land, we derive the legacy
-                // `(OutPoint, UtxoEntry)` slice for the existing consumers.
-                let (_total_fees, _mutations) =
+                // The returned mutation log is the single source of truth:
+                // commit_block_atomic writes both UTXOS_TABLE (from mutations)
+                // and SPENT_UTXOS_TABLE (from the derived spent_utxos slice)
+                // inside one atomic write_txn. Commit 4 will collapse the
+                // derived slice once the undo helpers move to mutations.
+                let (_total_fees, mutations) =
                     validate_and_apply_block_transactions_atomic(&block, &mut utxo_set).map_err(
                         |e| match e {
                             ValidationError::StateCorrupted(msg) => ProcessBlockError::Fatal(
@@ -2468,7 +2469,7 @@ impl Node {
                             )),
                         },
                     )?;
-                let spent_utxos = UtxoMutation::collect_spent_utxos(&_mutations);
+                let spent_utxos = UtxoMutation::collect_spent_utxos(&mutations);
 
                 // State root check (O(1) with incremental SMT)
                 let computed_state_root = utxo_set.state_root();
@@ -2485,11 +2486,16 @@ impl Node {
                     return Err("state root mismatch".into());
                 }
 
-                // Validation passed — atomic persist (single redb transaction)
-                if let Err(e) =
-                    self.storage
-                        .commit_block_atomic(&block, &new_tip.cumulative_work, &spent_utxos)
-                {
+                // Validation passed — atomic persist (single redb transaction).
+                // commit_block_atomic also writes UTXOS_TABLE from the same
+                // mutation log that mutated the in-memory UtxoSet, so the
+                // two views can't drift.
+                if let Err(e) = self.storage.commit_block_atomic(
+                    &block,
+                    &new_tip.cumulative_work,
+                    &spent_utxos,
+                    &mutations,
+                ) {
                     // Storage failed — undo in-memory mutations to stay consistent with disk
                     if let Err(undo_err) =
                         undo_block_transactions(&block, &mut utxo_set, &spent_utxos)

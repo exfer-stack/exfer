@@ -2860,19 +2860,21 @@ fn replay_chain(
             }
 
             // First start: apply genesis atomically (block + header +
-            // height index + work + tip in one write transaction).
+            // height index + work + tip + UTXOS in one write transaction).
             let genesis = genesis_block();
             let gid = genesis.header.block_id();
 
+            let mut genesis_mutations: Vec<crate::chain::state::UtxoMutation> = Vec::new();
             for tx in &genesis.transactions {
-                utxo_set
+                let m = utxo_set
                     .apply_transaction(tx, 0)
                     .map_err(|e| format!("genesis transaction failed: {:?}", e))?;
+                genesis_mutations.extend(m);
             }
 
             let genesis_work = work_from_target(&genesis.header.difficulty_target);
             storage
-                .commit_genesis_atomic(&genesis, &genesis_work)
+                .commit_genesis_atomic(&genesis, &genesis_work, &genesis_mutations)
                 .map_err(|e| format!("failed to commit genesis: {}", e))?;
 
             return Ok(ChainTip::genesis(gid, &genesis.header.difficulty_target));
@@ -3340,11 +3342,23 @@ async fn run_node(
 
     if !has_tip && !has_genesis_body {
         let genesis_work = work_from_target(&genesis.header.difficulty_target);
-        // Atomic genesis bootstrap: block + height_index + cumulative_work + tip
-        // in a single redb transaction. A crash mid-write cannot leave the
-        // database half-initialized (e.g. block stored but no tip pointer).
+        // Compute the genesis mutation log by applying the genesis
+        // transactions to a throwaway UtxoSet. commit_genesis_atomic seeds
+        // UTXOS_TABLE from this so the on-disk snapshot is born consistent.
+        let mut bootstrap_utxos = crate::chain::state::UtxoSet::new();
+        let mut genesis_mutations: Vec<crate::chain::state::UtxoMutation> = Vec::new();
+        for tx in &genesis.transactions {
+            let m = bootstrap_utxos
+                .apply_transaction(tx, 0)
+                .map_err(|e| format!("genesis transaction failed: {e}"))?;
+            genesis_mutations.extend(m);
+        }
+        // Atomic genesis bootstrap: block + height_index + cumulative_work +
+        // tip + UTXOS in a single redb transaction. A crash mid-write cannot
+        // leave the database half-initialized (e.g. block stored but no tip
+        // pointer, or tip set but UTXOS_TABLE empty).
         storage
-            .commit_genesis_atomic(&genesis, &genesis_work)
+            .commit_genesis_atomic(&genesis, &genesis_work, &genesis_mutations)
             .map_err(|e| format!("failed to store genesis block: {e}"))?;
         info!("Stored genesis block: {}", expected_genesis_id);
     }

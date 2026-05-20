@@ -1,4 +1,4 @@
-use crate::chain::state::UtxoEntry;
+use crate::chain::state::{UtxoEntry, UtxoMutation};
 use crate::types::block::{Block, BlockHeader, HEADER_SIZE};
 use crate::types::hash::Hash256;
 use crate::types::transaction::{OutPoint, SerError, TxOutput};
@@ -118,7 +118,6 @@ fn serialize_spent_utxos(spent: &[(OutPoint, UtxoEntry)]) -> Result<Vec<u8>, Ser
 /// Serialize a single UTXO entry for the Phase 3a UTXOS_TABLE.
 /// Format: output_len(u32 LE) | output_bytes | height(u64 LE) | is_coinbase(u8).
 /// Hand-rolled to match the rest of the storage layer (no bincode / serde).
-#[allow(dead_code)] // writer wired in commit 3 (persist UTXO mutations).
 fn serialize_utxo_entry(entry: &UtxoEntry) -> Result<Vec<u8>, SerError> {
     let output_bytes = entry.output.serialize()?;
     let mut buf = Vec::with_capacity(4 + output_bytes.len() + 8 + 1);
@@ -160,7 +159,6 @@ fn deserialize_utxo_entry(data: &[u8]) -> Option<UtxoEntry> {
 
 /// Serialize an OutPoint as the fixed 36-byte UTXOS_TABLE key.
 /// Layout: tx_id (32 bytes, raw) | output_index (u32 LE, 4 bytes).
-#[allow(dead_code)] // writer wired in commit 3 (persist UTXO mutations).
 fn serialize_outpoint_key(op: &OutPoint) -> [u8; 36] {
     let mut buf = [0u8; 36];
     buf[..32].copy_from_slice(op.tx_id.as_bytes());
@@ -179,6 +177,35 @@ fn deserialize_outpoint_key(data: &[u8]) -> Option<OutPoint> {
     tx_id_bytes.copy_from_slice(&data[..32]);
     let output_index = u32::from_le_bytes(data[32..].try_into().ok()?);
     Some(OutPoint::new(Hash256(tx_id_bytes), output_index))
+}
+
+/// Phase 3a — apply a mutation log to UTXOS_TABLE inside an existing
+/// write transaction. Insert variants write the serialized entry;
+/// Remove variants delete by key. Mutations are applied in order so the
+/// final state matches the in-memory sequence (matters for tx_A creates,
+/// tx_B in same block consumes intra-block dependencies).
+fn apply_utxo_mutations(
+    write_txn: &redb::WriteTransaction,
+    mutations: &[UtxoMutation],
+) -> Result<(), StorageError> {
+    if mutations.is_empty() {
+        return Ok(());
+    }
+    let mut utxos = write_txn.open_table(UTXOS_TABLE)?;
+    for m in mutations {
+        match m {
+            UtxoMutation::Insert(op, entry) => {
+                let key = serialize_outpoint_key(op);
+                let value = serialize_utxo_entry(entry)?;
+                utxos.insert(key.as_slice(), value.as_slice())?;
+            }
+            UtxoMutation::Remove(op, _entry) => {
+                let key = serialize_outpoint_key(op);
+                utxos.remove(key.as_slice())?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Deserialize a list of spent UTXOs from storage.
@@ -812,10 +839,15 @@ impl ChainStorage {
     /// Atomically store the genesis block, its cumulative work, and the tip pointer
     /// in a single redb write transaction. A crash between any of these writes
     /// cannot leave the database in a half-initialized state.
+    ///
+    /// `utxo_mutations` is the mutation log emitted by applying the genesis
+    /// transactions to a fresh UtxoSet. Persisted to UTXOS_TABLE inside the
+    /// same write_txn so the on-disk snapshot is born consistent.
     pub fn commit_genesis_atomic(
         &self,
         block: &Block,
         cumulative_work: &[u8; 32],
+        utxo_mutations: &[UtxoMutation],
     ) -> Result<(), StorageError> {
         let block_id = block.header.block_id();
         let block_bytes = block.serialize()?;
@@ -845,19 +877,29 @@ impl ChainStorage {
                     tx_idx.insert(tid.as_bytes().as_ref(), block.header.height)?;
                 }
             }
+
+            // Phase 3a — seed UTXOS_TABLE from the genesis mutation log.
+            apply_utxo_mutations(&write_txn, utxo_mutations)?;
         }
         write_txn.commit()?;
         Ok(())
     }
 
     /// Atomically commit a new canonical block (extends-tip path).
-    /// Performs store_block + cumulative_work + spent_utxos + canonical_height + tip
-    /// in a single redb write transaction for crash consistency.
+    /// Performs store_block + cumulative_work + spent_utxos + canonical_height
+    /// + tip + UTXO mutations in a single redb write transaction for crash
+    /// consistency.
+    ///
+    /// `utxo_mutations` is the mutation log returned by
+    /// `validate_and_apply_block_transactions_atomic` for this block.
+    /// Phase 3a (issue #6) — single source of truth: the same Vec that
+    /// mutated the in-memory UtxoSet also mutates UTXOS_TABLE here.
     pub fn commit_block_atomic(
         &self,
         block: &Block,
         cumulative_work: &[u8; 32],
         spent_utxos: &[(OutPoint, UtxoEntry)],
+        utxo_mutations: &[UtxoMutation],
     ) -> Result<(), StorageError> {
         let block_id = block.header.block_id();
         let block_bytes = block.serialize()?;
@@ -895,6 +937,9 @@ impl ChainStorage {
                     tx_idx.insert(tid.as_bytes().as_ref(), block.header.height)?;
                 }
             }
+
+            // Phase 3a — keep UTXOS_TABLE in lockstep with the in-memory set.
+            apply_utxo_mutations(&write_txn, utxo_mutations)?;
         }
         write_txn.commit()?;
         Ok(())

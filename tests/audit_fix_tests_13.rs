@@ -66,7 +66,9 @@ mod tx_script_budget_tests {
         let block_id = block.header.block_id();
         let work = [0x01u8; 32];
 
-        storage.commit_block_atomic(&block, &work, &[]).unwrap();
+        storage
+            .commit_block_atomic(&block, &work, &[], &[])
+            .unwrap();
 
         // Verify all data was written
         assert!(storage.has_block(&block_id).unwrap());
