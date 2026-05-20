@@ -148,6 +148,13 @@ enum Commands {
         /// honest peers (v1.8.x / v1.9.x empty-batch IBD-cascade bug).
         #[arg(long)]
         purge_bans: bool,
+        /// Disable automatic Phase 3a UTXO snapshot migration on first boot
+        /// of a pre-3a datadir. With this flag set, the node will fall
+        /// through to full chain replay on every restart until --rebuild-state
+        /// is run manually. Useful for operators who want predictable
+        /// downtime windows (per issue #6 Q2 hybrid migration UX).
+        #[arg(long)]
+        no_auto_migrate: bool,
     },
     /// Run the miner
     Mine {
@@ -192,6 +199,9 @@ enum Commands {
         /// honest peers (v1.8.x / v1.9.x empty-batch IBD-cascade bug).
         #[arg(long)]
         purge_bans: bool,
+        /// Disable automatic Phase 3a UTXO snapshot migration on first boot.
+        #[arg(long)]
+        no_auto_migrate: bool,
     },
     /// Wallet operations
     Wallet {
@@ -785,9 +795,10 @@ async fn main() {
             verify_all,
             no_assume_valid,
             purge_bans,
+            no_auto_migrate,
         } => {
             let peers = default_peers_if_empty(peers);
-            if let Err(e) = run_node(bind, peers, datadir, None, repair_perms, rpc_bind, verify_all, no_assume_valid, purge_bans).await {
+            if let Err(e) = run_node(bind, peers, datadir, None, repair_perms, rpc_bind, verify_all, no_assume_valid, purge_bans, no_auto_migrate).await {
                 error!("Node failed to start: {e}");
                 std::process::exit(1);
             }
@@ -805,6 +816,7 @@ async fn main() {
             verify_all,
             no_assume_valid,
             purge_bans,
+            no_auto_migrate,
         } => {
             let pubkey = if let Some(hex_str) = miner_pubkey {
                 let bytes = hex::decode(&hex_str).unwrap_or_else(|e| {
@@ -827,7 +839,7 @@ async fn main() {
             };
             let peers = default_peers_if_empty(raw_peers);
             if let Err(e) =
-                run_node(bind, peers, datadir, Some(pubkey), repair_perms, rpc_bind, verify_all, no_assume_valid, purge_bans).await
+                run_node(bind, peers, datadir, Some(pubkey), repair_perms, rpc_bind, verify_all, no_assume_valid, purge_bans, no_auto_migrate).await
             {
                 error!("Node failed to start: {e}");
                 std::process::exit(1);
@@ -2848,6 +2860,7 @@ fn open_chain(
     utxo_set: &mut UtxoSet,
     expected_genesis_id: &Hash256,
     assume_valid: bool,
+    auto_migrate: bool,
 ) -> Result<ChainTip, String> {
     // Bootstrap-from-empty / tip-missing remains entirely handled by
     // replay_chain (genesis seeding lives in the caller path before us
@@ -2863,7 +2876,9 @@ fn open_chain(
     };
 
     // Snapshot marker must (a) exist + complete and (b) point at the
-    // current tip. Anything else → fall through to full replay.
+    // current tip. Anything else → fall through to full replay, and
+    // (when auto_migrate is on) backfill the snapshot atomically at the
+    // end so the next boot takes the fast path.
     let snapshot_tip = storage
         .get_utxo_snapshot_tip()
         .map_err(|e| format!("db error reading utxo snapshot marker: {}", e))?;
@@ -2874,11 +2889,23 @@ fn open_chain(
                 "UTXO snapshot stale (snapshot_tip={} current_tip={}); falling through to full replay",
                 stale, tip_id
             );
-            return replay_chain(storage, utxo_set, expected_genesis_id, assume_valid);
+            return run_replay_and_maybe_migrate(
+                storage,
+                utxo_set,
+                expected_genesis_id,
+                assume_valid,
+                auto_migrate,
+            );
         }
         None => {
             info!("UTXO snapshot missing or incomplete; falling through to full replay");
-            return replay_chain(storage, utxo_set, expected_genesis_id, assume_valid);
+            return run_replay_and_maybe_migrate(
+                storage,
+                utxo_set,
+                expected_genesis_id,
+                assume_valid,
+                auto_migrate,
+            );
         }
     }
 
@@ -3014,6 +3041,59 @@ fn open_chain(
         height: tip_height,
         cumulative_work,
     })
+}
+
+/// Phase 3a — invoke `replay_chain` and, on success with `auto_migrate`,
+/// finalize the UTXO snapshot so the next boot uses the fast path.
+///
+/// Emits a single info line BEFORE replay_chain starts so operators see an
+/// expected-duration band and don't interrupt a multi-second to multi-minute
+/// backfill (per issue #6 review ask).
+fn run_replay_and_maybe_migrate(
+    storage: &Arc<ChainStorage>,
+    utxo_set: &mut UtxoSet,
+    expected_genesis_id: &Hash256,
+    assume_valid: bool,
+    auto_migrate: bool,
+) -> Result<ChainTip, String> {
+    if auto_migrate {
+        info!(
+            "Phase 3a migration: rebuilding UTXO snapshot via full chain replay. \
+             Expected duration: seconds to minutes depending on chain size and CPU \
+             (~30-60s on a ~500k block chain on commodity hardware). Do NOT interrupt — \
+             a clean restart resumes from scratch; an interrupted backfill leaves no \
+             on-disk inconsistency thanks to the atomic snapshot marker."
+        );
+    } else {
+        info!(
+            "Phase 3a migration disabled (--no-auto-migrate). Running full chain \
+             replay; UTXO snapshot will NOT be backfilled. Next boot will repeat \
+             this replay. Use --rebuild-state for a one-shot manual backfill."
+        );
+    }
+    let tip = replay_chain(storage, utxo_set, expected_genesis_id, assume_valid)?;
+    if auto_migrate {
+        let start = std::time::Instant::now();
+        let utxo_count = utxo_set.len();
+        storage
+            .finalize_utxo_snapshot(utxo_set, &tip.block_id)
+            .map_err(|e| {
+                format!(
+                    "Phase 3a snapshot backfill failed: {}. Replay state is in memory \
+                     this run, but the next restart will replay again. Restart with \
+                     --no-auto-migrate to skip the backfill attempt, or investigate \
+                     disk/space.",
+                    e
+                )
+            })?;
+        info!(
+            "Phase 3a migration complete: {} UTXOs persisted in {:.2}s. Next boot will \
+             use the fast open path.",
+            utxo_count,
+            start.elapsed().as_secs_f64()
+        );
+    }
+    Ok(tip)
 }
 
 /// Replay the canonical chain from genesis to tip, rebuilding the UTXO set
@@ -3339,8 +3419,10 @@ async fn run_node(
     verify_all: bool,
     no_assume_valid: bool,
     purge_bans: bool,
+    no_auto_migrate: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let assume_valid = !no_assume_valid && !verify_all;
+    let auto_migrate = !no_auto_migrate;
     std::fs::create_dir_all(&datadir)
         .map_err(|e| format!("failed to create data directory {}: {e}", datadir.display()))?;
 
@@ -3562,8 +3644,18 @@ async fn run_node(
 
     // Phase 3a — fast boot path: try the persisted UTXO snapshot + cheap
     // structural walk; fall through to full replay if the snapshot is
-    // missing, stale, or fails the state_root cross-check.
-    let tip = open_chain(&storage, &mut utxo_set, &expected_genesis_id, assume_valid).map_err(|e| {
+    // missing, stale, or fails the state_root cross-check. When auto_migrate
+    // is on (default), a successful full-replay fallback automatically
+    // backfills the snapshot inside `open_chain` so the next boot uses the
+    // fast path.
+    let tip = open_chain(
+        &storage,
+        &mut utxo_set,
+        &expected_genesis_id,
+        assume_valid,
+        auto_migrate,
+    )
+    .map_err(|e| {
         format!(
             "Chain open failed: {e}. Database may be corrupt. Delete data directory and re-sync."
         )

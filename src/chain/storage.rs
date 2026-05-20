@@ -639,6 +639,40 @@ impl ChainStorage {
     /// Returns `None` in every other case (missing markers, partial
     /// write, length mismatch). Open path interprets `None` as "no
     /// trustworthy snapshot, run replay_chain".
+    /// Phase 3a — finalize the UTXO snapshot: write every (OutPoint, UtxoEntry)
+    /// pair from the in-memory `UtxoSet` into UTXOS_TABLE, then atomically
+    /// set the two snapshot markers in META_TABLE. All inside a single redb
+    /// write_txn so any crash before commit() leaves the markers absent and
+    /// the next boot retries the backfill.
+    ///
+    /// Called once after the first successful `replay_chain` on a pre-3a
+    /// datadir (see `open_chain`'s migration branch).
+    ///
+    /// Caller responsibility: only invoke when UTXOS_TABLE is empty (the
+    /// first-iteration assumption). Resumable backfill from a partial write
+    /// is a future enhancement — restart-from-scratch is the documented
+    /// crash-recovery behavior for now.
+    pub fn finalize_utxo_snapshot(
+        &self,
+        utxo_set: &crate::chain::state::UtxoSet,
+        tip_id: &Hash256,
+    ) -> Result<(), StorageError> {
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut tbl = write_txn.open_table(UTXOS_TABLE)?;
+            for (op, entry) in utxo_set.iter() {
+                let key = serialize_outpoint_key(op);
+                let value = serialize_utxo_entry(entry)?;
+                tbl.insert(key.as_slice(), value.as_slice())?;
+            }
+            let mut meta = write_txn.open_table(META_TABLE)?;
+            meta.insert(UTXO_SNAPSHOT_COMPLETE_KEY, &[0x01u8][..])?;
+            meta.insert(UTXO_SNAPSHOT_TIP_KEY, tip_id.as_bytes().as_ref())?;
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
     #[allow(dead_code)] // wired in commit 5 (open_chain) and commit 6 (lazy migration).
     pub fn get_utxo_snapshot_tip(&self) -> Result<Option<Hash256>, StorageError> {
         let read_txn = self.db.begin_read()?;
