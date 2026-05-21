@@ -208,29 +208,58 @@ fn apply_utxo_mutations(
     Ok(())
 }
 
-/// Phase 3a — advance the snapshot marker inside an already-open META_TABLE
-/// write handle. Called from `commit_genesis_atomic` / `commit_block_atomic` /
-/// `commit_reorg_atomic` so that every tip update also moves the snapshot
-/// pointer atomically (issue #6 reviewer P1: a running node that processes
-/// any blocks between restarts must still hit `open_chain`'s fast path).
+/// Phase 3a — advance an existing complete snapshot's tip pointer inside an
+/// already-open META_TABLE write handle. Called from `commit_block_atomic`
+/// and `commit_reorg_atomic` so that every tip update on top of a known-
+/// complete snapshot also moves the marker atomically (issue #6 reviewer
+/// P1: a running node that processes any blocks between restarts must
+/// still hit `open_chain`'s fast path).
 ///
-/// `UTXO_SNAPSHOT_COMPLETE_KEY` is set to `[0x01]` only if not already — that
-/// makes `commit_genesis_atomic` the first writer on a fresh datadir and a
-/// no-op on later commits. The state_root cross-check in `open_chain`
-/// catches any inconsistency (e.g. a `--no-auto-migrate` boot where commit
-/// arrived before migration could have populated historical rows).
+/// **No-op when `UTXO_SNAPSHOT_COMPLETE_KEY` is absent.** A normal tip
+/// update only writes that one block's mutations into UTXOS_TABLE — it
+/// cannot truthfully promote a partial snapshot to "complete". Promoting
+/// it anyway would trap a `--no-auto-migrate` operator: their first new
+/// block would stamp a snapshot with one row's worth of UTXOs as
+/// complete, and the next `open_chain` would hard-fail on the state_root
+/// cross-check instead of falling back to replay as the help text
+/// promises.
+///
+/// Snapshot initialization (genesis bootstrap and the migration-finalize
+/// path) writes the COMPLETE key directly — see
+/// `initialize_snapshot_marker_in_txn` and `finalize_utxo_snapshot`.
 fn advance_snapshot_marker_in_txn(
     meta: &mut redb::Table<&'static str, &'static [u8]>,
     tip_id: &Hash256,
 ) -> Result<(), StorageError> {
-    meta.insert(UTXO_SNAPSHOT_TIP_KEY, tip_id.as_bytes().as_ref())?;
     let already_complete = matches!(
         meta.get(UTXO_SNAPSHOT_COMPLETE_KEY)?,
         Some(v) if v.value() == [0x01u8]
     );
     if !already_complete {
-        meta.insert(UTXO_SNAPSHOT_COMPLETE_KEY, &[0x01u8][..])?;
+        // Legacy datadir or post-`clear_utxo_snapshot` state: leave both
+        // keys absent so `open_chain` keeps falling back to replay.
+        return Ok(());
     }
+    meta.insert(UTXO_SNAPSHOT_TIP_KEY, tip_id.as_bytes().as_ref())?;
+    Ok(())
+}
+
+/// Phase 3a — initialize the snapshot marker for a known-complete on-disk
+/// UTXO state. Used by `commit_genesis_atomic` (the genesis write
+/// populates UTXOS_TABLE from the full genesis mutation log in the same
+/// write_txn, so the snapshot is complete by construction) and pairs with
+/// `finalize_utxo_snapshot` for the migration-backfill path.
+///
+/// Unconditionally writes both `UTXO_SNAPSHOT_TIP_KEY` and
+/// `UTXO_SNAPSHOT_COMPLETE_KEY = [0x01]`. Subsequent
+/// `advance_snapshot_marker_in_txn` calls then move the tip pointer
+/// because COMPLETE is now set.
+fn initialize_snapshot_marker_in_txn(
+    meta: &mut redb::Table<&'static str, &'static [u8]>,
+    tip_id: &Hash256,
+) -> Result<(), StorageError> {
+    meta.insert(UTXO_SNAPSHOT_TIP_KEY, tip_id.as_bytes().as_ref())?;
+    meta.insert(UTXO_SNAPSHOT_COMPLETE_KEY, &[0x01u8][..])?;
     Ok(())
 }
 
@@ -957,11 +986,12 @@ impl ChainStorage {
             let mut meta = write_txn.open_table(META_TABLE)?;
             meta.insert(TIP_KEY, block_id.as_bytes().as_ref())?;
 
-            // Phase 3a — advance the snapshot marker in the same write_txn
-            // that advances TIP_KEY. Fresh-datadir bootstrap seeds UTXOS_TABLE
-            // from the genesis mutation log below, so the snapshot is
-            // trivially complete; set both markers.
-            advance_snapshot_marker_in_txn(&mut meta, &block_id)?;
+            // Phase 3a — fresh-datadir bootstrap seeds UTXOS_TABLE from the
+            // full genesis mutation log below in this same write_txn, so the
+            // on-disk snapshot is complete by construction. Initialize both
+            // marker keys; subsequent commit_block_atomic / commit_reorg_atomic
+            // calls then advance just the tip pointer.
+            initialize_snapshot_marker_in_txn(&mut meta, &block_id)?;
 
             // Index genesis transaction IDs
             let mut tx_idx = write_txn.open_table(TX_INDEX_TABLE)?;
@@ -2012,20 +2042,37 @@ mod tests {
 
     #[test]
     fn commit_block_atomic_advances_snapshot_marker_to_new_tip() {
-        // Issue #6 reviewer P1: every tip advance must move
-        // UTXO_SNAPSHOT_TIP_KEY atomically with TIP_KEY. Without this,
-        // any block processed between restarts strands the marker on
-        // the previous tip, and the next `open_chain` falls into the
-        // "snapshot stale" path despite UTXOS_TABLE being live.
-        //
-        // The original PR only wrote the marker from `finalize_utxo_snapshot`
-        // (migration-only), so this assertion would have failed.
+        // Issue #6 reviewer P1: when the snapshot is already complete (the
+        // common steady state), every tip advance must move
+        // UTXO_SNAPSHOT_TIP_KEY atomically with TIP_KEY. Without this, any
+        // block processed between restarts strands the marker on the
+        // previous tip and the next `open_chain` logs "snapshot stale" and
+        // falls back to a full replay despite UTXOS_TABLE being live.
         let tmpdir = TempDir::new().unwrap();
         let storage = ChainStorage::open(&tmpdir.path().join("test.redb")).unwrap();
         let work = [0u8; 32];
 
-        // 1. First block establishes the marker.
-        let block1 = test_block();
+        // Initialize a complete snapshot via the genesis path. This is the
+        // precondition `advance_snapshot_marker_in_txn` requires (it's a
+        // no-op when COMPLETE is absent; see the helper's docstring for
+        // the legacy-datadir + --no-auto-migrate rationale).
+        let genesis = crate::genesis::genesis_block();
+        let mut bootstrap_set = crate::chain::state::UtxoSet::new();
+        let mut genesis_muts: Vec<UtxoMutation> = Vec::new();
+        for tx in &genesis.transactions {
+            genesis_muts.extend(bootstrap_set.apply_transaction(tx, 0).unwrap());
+        }
+        storage
+            .commit_genesis_atomic(&genesis, &work, &genesis_muts)
+            .unwrap();
+
+        // First non-genesis block: marker advances to its id.
+        let block1 = {
+            let mut b = test_block();
+            b.header.height = 1;
+            b.header.prev_block_id = genesis.header.block_id();
+            b
+        };
         let block1_id = block1.header.block_id();
         let (op_a, entry_a) = sample_utxo(1);
         storage
@@ -2039,15 +2086,15 @@ mod tests {
         assert_eq!(
             storage.get_utxo_snapshot_tip().unwrap(),
             Some(block1_id),
-            "first commit_block_atomic sets the marker to its tip"
+            "commit_block_atomic advances the marker when COMPLETE is set"
         );
 
-        // 2. Second block advances it. Without the P1 fix the marker
-        //    would still point at block1_id here and reopen would log
-        //    "snapshot stale".
+        // Second block: marker advances again. Without the P1 fix the
+        // marker would still point at block1_id here and reopen would log
+        // "snapshot stale".
         let block2 = {
             let mut b = test_block();
-            b.header.height = 1;
+            b.header.height = 2;
             b.header.prev_block_id = block1_id;
             b
         };
@@ -2067,13 +2114,43 @@ mod tests {
             "second commit_block_atomic advances the marker to the new tip"
         );
 
-        // 3. Marker survives a storage reopen (it's persisted, not cached).
+        // Marker survives a storage reopen (it's persisted, not cached).
         drop(storage);
         let storage2 = ChainStorage::open(&tmpdir.path().join("test.redb")).unwrap();
         assert_eq!(
             storage2.get_utxo_snapshot_tip().unwrap(),
             Some(block2_id),
             "marker persists across reopen — open_chain would take the fast path"
+        );
+    }
+
+    #[test]
+    fn commit_block_atomic_does_not_promote_partial_snapshot_to_complete() {
+        // Regression for the post-P1 follow-up: a tip update on top of an
+        // incomplete snapshot (legacy datadir, post-`clear_utxo_snapshot`,
+        // or a `--no-auto-migrate` boot before migration runs) must NOT
+        // stamp UTXO_SNAPSHOT_COMPLETE_KEY. Otherwise the next reopen
+        // hard-fails into the corruption error path instead of falling
+        // back to replay as the `--no-auto-migrate` help text promises.
+        let tmpdir = TempDir::new().unwrap();
+        let storage = ChainStorage::open(&tmpdir.path().join("test.redb")).unwrap();
+        let work = [0u8; 32];
+
+        // Datadir with chain data but no snapshot markers — same shape as
+        // a pre-Phase-3a datadir on its first boot, before any migration.
+        let block = test_block();
+        let (op, entry) = sample_utxo(0);
+        storage
+            .commit_block_atomic(
+                &block,
+                &work,
+                &[],
+                &[UtxoMutation::Insert(op, entry.clone())],
+            )
+            .unwrap();
+        assert!(
+            storage.get_utxo_snapshot_tip().unwrap().is_none(),
+            "commit_block_atomic must not promote a partial snapshot to complete"
         );
     }
 

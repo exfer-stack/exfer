@@ -168,6 +168,51 @@ fn open_chain_auto_migrate_backfills_snapshot_on_fallback() {
 }
 
 #[test]
+fn no_auto_migrate_replays_on_every_restart() {
+    // Reviewer follow-up to P1: a legacy pre-Phase-3a datadir running
+    // with `--no-auto-migrate` must fall back to replay on EVERY
+    // restart, never the corruption error path. The pre-follow-up code
+    // let the first `commit_block_atomic` after a fallback stamp the
+    // partial UTXOS_TABLE state as complete, which trapped the next
+    // reopen on the state_root mismatch. The fix splits the marker
+    // helpers: `advance_snapshot_marker_in_txn` is a no-op while
+    // `UTXO_SNAPSHOT_COMPLETE_KEY` is absent, so the markers stay
+    // absent across any number of block commits and `open_chain`'s
+    // marker check always selects the fallback branch.
+    let dir = TempDir::new().unwrap();
+    let storage = fresh_storage(&dir, "test.redb");
+    let genesis_id = genesis_block().header.block_id();
+    let mut utxos = UtxoSet::new();
+    let _ = open_chain(&storage, &mut utxos, &genesis_id, false, true).unwrap();
+    let canonical_root = utxos.state_root();
+
+    // Pretend this is a pre-Phase-3a datadir.
+    storage
+        .clear_utxo_snapshot()
+        .expect("simulate pre-3a datadir");
+
+    // Three back-to-back restarts with --no-auto-migrate. Each must
+    // fall back, never hit the fast path, never raise corruption.
+    drop(storage);
+    for restart in 1..=3 {
+        let s = fresh_storage(&dir, "test.redb");
+        let mut u = UtxoSet::new();
+        let tip = open_chain(&s, &mut u, &genesis_id, false, false)
+            .unwrap_or_else(|e| panic!("restart {restart}: open_chain must not error: {e}"));
+        assert_eq!(tip.block_id, genesis_id, "restart {restart}: tip stable");
+        assert_eq!(
+            u.state_root(),
+            canonical_root,
+            "restart {restart}: replay-derived state_root matches canonical"
+        );
+        assert!(
+            s.get_utxo_snapshot_tip().unwrap().is_none(),
+            "restart {restart}: --no-auto-migrate leaves the markers absent"
+        );
+    }
+}
+
+#[test]
 fn rebuild_state_recovery_loop_clears_and_finalizes_in_one_boot() {
     // Mirrors the `--rebuild-state` CLI flow that the operator runs after
     // hitting the "snapshot is corrupt" error in `open_chain`:
