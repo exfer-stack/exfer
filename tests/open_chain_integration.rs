@@ -76,23 +76,29 @@ fn open_chain_fast_path_succeeds_on_populated_snapshot() {
 
 #[test]
 fn open_chain_falls_back_to_replay_when_marker_absent() {
-    // 1. Bootstrap genesis but deliberately do NOT call
-    //    finalize_utxo_snapshot, leaving the marker absent.
+    // Simulates a pre-Phase-3a (legacy) datadir: chain data is intact
+    // but the snapshot markers don't exist. After the P1 fix, fresh
+    // bootstraps seed the marker via `commit_genesis_atomic`, so we
+    // explicitly clear the snapshot state to reach the legacy shape.
     let dir = TempDir::new().unwrap();
     let storage = fresh_storage(&dir, "test.redb");
     let genesis_id = genesis_block().header.block_id();
     let mut utxos = UtxoSet::new();
     let tip1 = open_chain(&storage, &mut utxos, &genesis_id, false, false).unwrap();
     let root1 = utxos.state_root();
+
+    storage
+        .clear_utxo_snapshot()
+        .expect("simulate pre-3a datadir");
     assert!(
         storage.get_utxo_snapshot_tip().unwrap().is_none(),
-        "marker absent (no finalize called)"
+        "marker cleared — simulating legacy datadir"
     );
 
-    // 2. Re-open: marker absent → open_chain logs "falling through" and
-    //    delegates to replay_chain via run_replay_and_maybe_migrate. With
-    //    auto_migrate=false the snapshot stays unmarked after replay,
-    //    matching the `--no-auto-migrate` operator preference.
+    // Re-open: marker absent → open_chain logs "falling through" and
+    // delegates to replay_chain via run_replay_and_maybe_migrate. With
+    // auto_migrate=false the snapshot stays unmarked after replay,
+    // matching the `--no-auto-migrate` operator preference.
     drop(storage);
     let storage2 = fresh_storage(&dir, "test.redb");
     let mut utxos2 = UtxoSet::new();
@@ -108,26 +114,31 @@ fn open_chain_falls_back_to_replay_when_marker_absent() {
 
 #[test]
 fn open_chain_auto_migrate_backfills_snapshot_on_fallback() {
-    // 1. Empty DB, first open: replay bootstraps genesis. With auto_migrate=
-    //    true the post-replay backfill SHOULD set the marker so subsequent
-    //    opens take the fast path.
+    // Verifies the lazy-migration UX for a legacy pre-Phase-3a datadir:
+    // chain data is intact but the snapshot markers don't exist. With
+    // `auto_migrate=true`, the first open should fall through to replay
+    // and finalize a fresh snapshot, so the second open hits the fast
+    // path.
     let dir = TempDir::new().unwrap();
     let storage = fresh_storage(&dir, "test.redb");
     let genesis_id = genesis_block().header.block_id();
     let mut utxos = UtxoSet::new();
     let _tip = open_chain(&storage, &mut utxos, &genesis_id, false, true)
-        .expect("first open with auto_migrate");
+        .expect("first open bootstraps genesis");
 
-    // 2. NOTE: replay_chain's tip-None branch returns ChainTip::genesis
-    //    directly without going through run_replay_and_maybe_migrate, so
-    //    on the very first ever boot (empty DB) the marker is NOT set yet
-    //    even with auto_migrate=true — finalize only runs on the
-    //    "tip-present-but-snapshot-absent" path. This is by design: the
-    //    initial commit_genesis_atomic already populated UTXOS_TABLE, so
-    //    the marker just needs to be set on a subsequent open.
-    //
-    //    Verify the second open WITH auto_migrate sets the marker by going
-    //    through the fallback path.
+    // Pretend this is a pre-Phase-3a datadir by clearing the snapshot
+    // state (after the P1 fix, commit_genesis_atomic seeds the marker
+    // automatically, which is the Phase-3a steady-state behavior).
+    storage
+        .clear_utxo_snapshot()
+        .expect("simulate pre-3a datadir");
+    assert!(
+        storage.get_utxo_snapshot_tip().unwrap().is_none(),
+        "marker cleared — legacy-datadir shape"
+    );
+
+    // Second open WITH auto_migrate: marker absent → fallback to replay
+    // → finalize_utxo_snapshot writes the marker.
     drop(storage);
     let storage2 = fresh_storage(&dir, "test.redb");
     let mut utxos2 = UtxoSet::new();
@@ -136,10 +147,10 @@ fn open_chain_auto_migrate_backfills_snapshot_on_fallback() {
     assert_eq!(
         storage2.get_utxo_snapshot_tip().unwrap(),
         Some(genesis_id),
-        "auto_migrate set the marker on the fallback path"
+        "auto_migrate finalized the snapshot during fallback"
     );
 
-    // 3. Third open should now hit the fast path (marker present, tip match).
+    // Third open should now hit the fast path (marker present, tip match).
     drop(storage2);
     let storage3 = fresh_storage(&dir, "test.redb");
     let mut utxos3 = UtxoSet::new();
