@@ -22,16 +22,14 @@ mod script;
 mod types;
 mod wallet;
 
-use chain::fork_choice::ChainTip;
+use chain::open::open_chain;
 use chain::state::UtxoSet;
 use chain::storage::ChainStorage;
 use clap::{Parser, Subcommand};
-use consensus::difficulty::{add_work, expected_difficulty, work_from_target};
+use consensus::difficulty::{expected_difficulty, work_from_target};
 use consensus::validation::{
-    apply_block_transactions_assume_valid, validate_and_apply_block_transactions_atomic,
-};
-use consensus::validation::{
-    median_time_past, validate_block_header, validate_block_header_skip_pow,
+    median_time_past, validate_and_apply_block_transactions_atomic, validate_block_header,
+    validate_block_header_skip_pow,
 };
 use genesis::genesis_block;
 use mempool::Mempool;
@@ -148,6 +146,21 @@ enum Commands {
         /// honest peers (v1.8.x / v1.9.x empty-batch IBD-cascade bug).
         #[arg(long)]
         purge_bans: bool,
+        /// Disable automatic Phase 3a UTXO snapshot migration on first boot
+        /// of a pre-3a datadir. With this flag set, the node will fall
+        /// through to full chain replay on every restart until --rebuild-state
+        /// is run manually. Useful for operators who want predictable
+        /// downtime windows (per issue #6 Q2 hybrid migration UX).
+        #[arg(long)]
+        no_auto_migrate: bool,
+        /// One-shot: delete UTXOS_TABLE + clear snapshot markers, run a full
+        /// chain replay from BLOCKS_TABLE, then finalize a fresh snapshot.
+        /// Use after the Phase 3a snapshot fails the state_root cross-check
+        /// ("snapshot is corrupt" error). The on-disk chain (`chain.redb`
+        /// blocks/headers/work/spent_utxos) is preserved — only the derived
+        /// UTXO snapshot is rebuilt. Implies `--auto-migrate`.
+        #[arg(long)]
+        rebuild_state: bool,
     },
     /// Run the miner
     Mine {
@@ -192,6 +205,14 @@ enum Commands {
         /// honest peers (v1.8.x / v1.9.x empty-batch IBD-cascade bug).
         #[arg(long)]
         purge_bans: bool,
+        /// Disable automatic Phase 3a UTXO snapshot migration on first boot.
+        #[arg(long)]
+        no_auto_migrate: bool,
+        /// One-shot: rebuild the Phase 3a UTXO snapshot from a full chain
+        /// replay (see `node --rebuild-state` for details). Implies
+        /// `--auto-migrate`.
+        #[arg(long)]
+        rebuild_state: bool,
     },
     /// Wallet operations
     Wallet {
@@ -785,9 +806,11 @@ async fn main() {
             verify_all,
             no_assume_valid,
             purge_bans,
+            no_auto_migrate,
+            rebuild_state,
         } => {
             let peers = default_peers_if_empty(peers);
-            if let Err(e) = run_node(bind, peers, datadir, None, repair_perms, rpc_bind, verify_all, no_assume_valid, purge_bans).await {
+            if let Err(e) = run_node(bind, peers, datadir, None, repair_perms, rpc_bind, verify_all, no_assume_valid, purge_bans, no_auto_migrate, rebuild_state).await {
                 error!("Node failed to start: {e}");
                 std::process::exit(1);
             }
@@ -805,6 +828,8 @@ async fn main() {
             verify_all,
             no_assume_valid,
             purge_bans,
+            no_auto_migrate,
+            rebuild_state,
         } => {
             let pubkey = if let Some(hex_str) = miner_pubkey {
                 let bytes = hex::decode(&hex_str).unwrap_or_else(|e| {
@@ -827,7 +852,7 @@ async fn main() {
             };
             let peers = default_peers_if_empty(raw_peers);
             if let Err(e) =
-                run_node(bind, peers, datadir, Some(pubkey), repair_perms, rpc_bind, verify_all, no_assume_valid, purge_bans).await
+                run_node(bind, peers, datadir, Some(pubkey), repair_perms, rpc_bind, verify_all, no_assume_valid, purge_bans, no_auto_migrate, rebuild_state).await
             {
                 error!("Node failed to start: {e}");
                 std::process::exit(1);
@@ -2819,316 +2844,6 @@ fn sign_tx_with_wallet(
     w.signing_key_for_cli().sign(&sig_msg)
 }
 
-/// Replay the canonical chain from genesis to tip, rebuilding the UTXO set
-/// and validating every block. Returns the chain tip on success.
-///
-/// All corruption/inconsistency conditions return `Err` instead of panicking,
-/// so the caller can log cleanly and exit gracefully.
-fn replay_chain(
-    storage: &Arc<ChainStorage>,
-    utxo_set: &mut UtxoSet,
-    expected_genesis_id: &Hash256,
-    assume_valid: bool,
-) -> Result<ChainTip, String> {
-    let tip_id = match storage
-        .get_tip()
-        .map_err(|e| format!("db error reading tip: {}", e))?
-    {
-        Some(id) => id,
-        None => {
-            // Fail-closed: if TIP is missing but HEIGHT_INDEX has entries,
-            // the database is corrupt — do not silently normalize.
-            if !storage
-                .height_index_is_empty()
-                .map_err(|e| format!("db error checking height index: {}", e))?
-            {
-                return Err(
-                    "tip metadata missing but height index is not empty; database may be corrupt"
-                        .to_string(),
-                );
-            }
-
-            // Also check blocks table — only commit genesis into a truly empty database.
-            if !storage
-                .blocks_table_is_empty()
-                .map_err(|e| format!("db error checking blocks table: {}", e))?
-            {
-                return Err(
-                    "tip metadata missing but blocks table is not empty; database may be corrupt"
-                        .to_string(),
-                );
-            }
-
-            // First start: apply genesis atomically (block + header +
-            // height index + work + tip in one write transaction).
-            let genesis = genesis_block();
-            let gid = genesis.header.block_id();
-
-            for tx in &genesis.transactions {
-                utxo_set
-                    .apply_transaction(tx, 0)
-                    .map_err(|e| format!("genesis transaction failed: {:?}", e))?;
-            }
-
-            let genesis_work = work_from_target(&genesis.header.difficulty_target);
-            storage
-                .commit_genesis_atomic(&genesis, &genesis_work)
-                .map_err(|e| format!("failed to commit genesis: {}", e))?;
-
-            return Ok(ChainTip::genesis(gid, &genesis.header.difficulty_target));
-        }
-    };
-
-    // Get tip height for bounded forward walk
-    let tip_header = storage
-        .get_header(&tip_id)
-        .map_err(|e| format!("db error reading tip header: {}", e))?
-        .ok_or_else(|| format!("tip block header {} not found", tip_id))?;
-    let tip_height = tip_header.height;
-
-    // Check if assume-valid checkpoint is proven: chain must be at or past
-    // checkpoint height AND the block at that height must match the hash.
-    let assume_valid_proven = assume_valid && tip_height >= types::ASSUME_VALID_HEIGHT && {
-        match storage
-            .get_block_id_by_height(types::ASSUME_VALID_HEIGHT)
-            .map_err(|e| format!("db error checking checkpoint: {}", e))?
-        {
-            Some(id) => id == Hash256(types::ASSUME_VALID_HASH),
-            None => false,
-        }
-    };
-    if assume_valid {
-        if assume_valid_proven {
-            info!(
-                "Assume-valid checkpoint verified in storage at height {}",
-                types::ASSUME_VALID_HEIGHT
-            );
-        } else {
-            info!("Assume-valid checkpoint not yet proven — full PoW verification during replay");
-        }
-    }
-
-    let mut cumulative_work = [0u8; 32];
-    let mut block_count = 0u64;
-    let mut prev_id = Hash256::ZERO; // genesis has prev = ZERO
-
-    let replay_start = std::time::Instant::now();
-
-    info!("Replaying {} blocks...", tip_height + 1);
-
-    // Forward walk using height index — one block at a time, no Vec accumulation
-    for height in 0..=tip_height {
-        let block_id = storage
-            .get_block_id_by_height(height)
-            .map_err(|e| format!("db error at height {}: {}", height, e))?
-            .ok_or_else(|| {
-                format!(
-                    "height index missing entry at height {} during replay",
-                    height
-                )
-            })?;
-
-        // Verify height 0 is our expected genesis
-        if height == 0 && block_id != *expected_genesis_id {
-            return Err(format!(
-                "height 0 block {} does not match expected genesis {}; \
-                 database belongs to a different chain",
-                block_id, expected_genesis_id
-            ));
-        }
-
-        let block = storage
-            .get_block(&block_id)
-            .map_err(|e| format!("db error reading block at height {}: {}", height, e))?
-            .ok_or_else(|| {
-                format!(
-                    "block {} at height {} not found during replay",
-                    block_id, height
-                )
-            })?;
-
-        // Verify chain linkage (catches corrupt height index)
-        if block.header.prev_block_id != prev_id {
-            return Err(format!(
-                "chain linkage broken at height {}: block prev_block_id {} != expected {}",
-                height, block.header.prev_block_id, prev_id
-            ));
-        }
-
-        // Full consensus validation (skip header for genesis — already PoW-checked)
-        if block.header.height > 0 {
-            let parent_header = storage
-                .get_header(&block.header.prev_block_id)
-                .map_err(|e| format!("db error reading parent header at height {}: {}", height, e))?
-                .ok_or_else(|| {
-                    format!("parent header not found at height {} during replay", height)
-                })?;
-            let ancestor_timestamps = storage
-                .get_ancestor_timestamps(&block.header.prev_block_id, MTP_WINDOW)
-                .map_err(|e| {
-                    format!(
-                        "db error reading ancestor timestamps at height {}: {}",
-                        height, e
-                    )
-                })?;
-            let expected_target =
-                expected_difficulty(storage, &block.header.prev_block_id, block.header.height)
-                    .map_err(|e| {
-                        format!("difficulty computation failed at height {}: {}", height, e)
-                    })?;
-
-            // Assume-valid: skip PoW for blocks at/below checkpoint, but ONLY
-            // if the checkpoint block is already in storage and matches.
-            // If chain is shorter than checkpoint, verify full PoW.
-            let skip_pow = assume_valid_proven && height <= types::ASSUME_VALID_HEIGHT;
-            if !skip_pow {
-                validate_block_header(
-                    &block,
-                    Some(&parent_header),
-                    &ancestor_timestamps,
-                    &expected_target,
-                    None,
-                )
-            } else {
-                validate_block_header_skip_pow(
-                    &block,
-                    Some(&parent_header),
-                    &ancestor_timestamps,
-                    &expected_target,
-                    None,
-                )
-            }
-            .map_err(|e| {
-                format!(
-                    "block header validation failed at height {}: {:?}",
-                    block.header.height, e
-                )
-            })?;
-
-            // Assume-valid checkpoint during replay (redundant if already proven,
-            // but verifies integrity on every replay)
-            if assume_valid_proven && height == types::ASSUME_VALID_HEIGHT {
-                use crate::types::hash::Hash256;
-                let expected = Hash256(types::ASSUME_VALID_HASH);
-                let actual = block.header.block_id();
-                if actual != expected {
-                    return Err(format!(
-                        "assume-valid checkpoint failed during replay at height {}: expected {}, got {}",
-                        types::ASSUME_VALID_HEIGHT, expected, actual
-                    ));
-                }
-            }
-        }
-
-        // Apply the block to the UTXO set. Two paths:
-        //
-        // - If the assume-valid checkpoint is proven AND this block is at or
-        //   below `ASSUME_VALID_HEIGHT`, skip signature/script validation —
-        //   the block was validated when first imported and the downstream
-        //   per-block state-root check still detects mis-application.
-        //
-        // - Otherwise, full validation as before.
-        //
-        // `spent_utxos` was historically re-persisted here; it's already on
-        // disk from the original commit (see NOTE below), so the value is
-        // only used for the in-memory mutation each path performs.
-        let skip_tx_validation = assume_valid_proven && height <= types::ASSUME_VALID_HEIGHT;
-        let apply_result = if skip_tx_validation {
-            apply_block_transactions_assume_valid(&block, utxo_set)
-        } else {
-            validate_and_apply_block_transactions_atomic(&block, utxo_set)
-        };
-        let (_fees, _spent_utxos) = apply_result.map_err(|e| {
-            format!(
-                "block transaction {} failed at height {}: {:?}",
-                if skip_tx_validation { "apply" } else { "validation" },
-                block.header.height,
-                e
-            )
-        })?;
-
-        // TX indexing during replay is deferred — commit_block_atomic and
-        // commit_reorg_atomic index new blocks as they arrive. Doing per-block
-        // index_tx writes during replay of 28K+ blocks causes OOM on
-        // memory-constrained nodes (each write transaction buffers in redb).
-
-        // Verify state integrity (O(1) with incremental SMT)
-        let computed = utxo_set.state_root();
-        if computed != block.header.state_root {
-            return Err(format!(
-                "state root mismatch at height {}: expected {}, got {}",
-                block.header.height, block.header.state_root, computed
-            ));
-        }
-
-        // NOTE: `store_spent_utxos` and `put_cumulative_work` were called
-        // here per-block in earlier versions, but both are *already*
-        // persisted atomically by `commit_block_atomic` /
-        // `commit_reorg_atomic` (chain/storage.rs) when the block first
-        // arrives. Re-writing them on every replay was duplicate I/O —
-        // 2 extra redb write transactions per block, each with its own
-        // fsync. At chain heights in the 100k+ range this dominated
-        // replay wall time on slow / network-attached storage.
-        //
-        // Atomicity invariant: if `storage.get_block(&block_id)` succeeded
-        // above, then the commit transaction that wrote the block also
-        // wrote spent_utxos + cumulative_work, so they are present.
-        let block_work = work_from_target(&block.header.difficulty_target);
-        cumulative_work = add_work(&cumulative_work, &block_work);
-
-        // Progress logging every 1000 blocks
-        if (height + 1) % 1000 == 0 || height == tip_height {
-            let elapsed = replay_start.elapsed().as_secs();
-            let pct = (height + 1) as f64 / (tip_height + 1) as f64 * 100.0;
-            info!(
-                "Replay progress: {}/{} blocks ({:.1}%) in {}s",
-                height + 1,
-                tip_height + 1,
-                pct,
-                elapsed,
-            );
-        }
-
-        prev_id = block_id;
-        block_count += 1;
-    }
-
-    // Final consistency check: last replayed block must equal persisted tip
-    if prev_id != tip_id {
-        return Err(format!(
-            "replay/tip mismatch: last replayed block {} != persisted tip {}; \
-             height index and tip metadata are inconsistent",
-            prev_id, tip_id
-        ));
-    }
-
-    let (smt_nodes, smt_leaves) = utxo_set.smt_stats();
-    info!(
-        "Replayed {} blocks, UTXO set has {} entries, SMT: {} nodes + {} leaves",
-        block_count,
-        utxo_set.len(),
-        smt_nodes,
-        smt_leaves,
-    );
-
-    // Memory diagnostics: log RSS after replay
-    #[cfg(target_os = "linux")]
-    {
-        if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
-            for line in status.lines() {
-                if line.starts_with("VmRSS:") || line.starts_with("VmSize:") {
-                    info!("Memory after replay: {}", line.trim());
-                }
-            }
-        }
-    }
-
-    Ok(ChainTip {
-        block_id: tip_id,
-        height: tip_height,
-        cumulative_work,
-    })
-}
 
 async fn run_node(
     bind: SocketAddr,
@@ -3140,8 +2855,13 @@ async fn run_node(
     verify_all: bool,
     no_assume_valid: bool,
     purge_bans: bool,
+    no_auto_migrate: bool,
+    rebuild_state: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let assume_valid = !no_assume_valid && !verify_all;
+    // --rebuild-state forces auto_migrate=true: after clearing the snapshot
+    // we WANT open_chain's fallback to finalize a fresh one in the same boot.
+    let auto_migrate = !no_auto_migrate || rebuild_state;
     std::fs::create_dir_all(&datadir)
         .map_err(|e| format!("failed to create data directory {}: {e}", datadir.display()))?;
 
@@ -3340,19 +3060,64 @@ async fn run_node(
 
     if !has_tip && !has_genesis_body {
         let genesis_work = work_from_target(&genesis.header.difficulty_target);
-        // Atomic genesis bootstrap: block + height_index + cumulative_work + tip
-        // in a single redb transaction. A crash mid-write cannot leave the
-        // database half-initialized (e.g. block stored but no tip pointer).
+        // Compute the genesis mutation log by applying the genesis
+        // transactions to a throwaway UtxoSet. commit_genesis_atomic seeds
+        // UTXOS_TABLE from this so the on-disk snapshot is born consistent.
+        let mut bootstrap_utxos = crate::chain::state::UtxoSet::new();
+        let mut genesis_mutations: Vec<crate::chain::state::UtxoMutation> = Vec::new();
+        for tx in &genesis.transactions {
+            let m = bootstrap_utxos
+                .apply_transaction(tx, 0)
+                .map_err(|e| format!("genesis transaction failed: {e}"))?;
+            genesis_mutations.extend(m);
+        }
+        // Atomic genesis bootstrap: block + height_index + cumulative_work +
+        // tip + UTXOS in a single redb transaction. A crash mid-write cannot
+        // leave the database half-initialized (e.g. block stored but no tip
+        // pointer, or tip set but UTXOS_TABLE empty).
         storage
-            .commit_genesis_atomic(&genesis, &genesis_work)
+            .commit_genesis_atomic(&genesis, &genesis_work, &genesis_mutations)
             .map_err(|e| format!("failed to store genesis block: {e}"))?;
         info!("Stored genesis block: {}", expected_genesis_id);
     }
 
-    // P1-5: Reconstruct state by replaying chain from genesis to tip
-    let tip = replay_chain(&storage, &mut utxo_set, &expected_genesis_id, assume_valid).map_err(|e| {
+    // Phase 3a recovery — `--rebuild-state` clears the persisted snapshot
+    // (UTXOS_TABLE + both markers) so that the open_chain call below is
+    // forced down the fallback path. With auto_migrate=true (forced above),
+    // the post-replay finalize then writes a fresh snapshot, in the same
+    // boot. The underlying chain data (blocks/headers/work/spent_utxos) is
+    // preserved.
+    if rebuild_state {
+        let before = storage
+            .get_utxo_snapshot_tip()
+            .map_err(|e| format!("rebuild-state: failed to read snapshot marker: {e}"))?;
+        storage
+            .clear_utxo_snapshot()
+            .map_err(|e| format!("rebuild-state: failed to clear UTXO snapshot: {e}"))?;
+        info!(
+            "--rebuild-state: cleared UTXO snapshot (was {}); rebuilding via full chain replay",
+            before
+                .map(|h| h.to_string())
+                .unwrap_or_else(|| "absent".to_string())
+        );
+    }
+
+    // Phase 3a — fast boot path: try the persisted UTXO snapshot + cheap
+    // structural walk; fall through to full replay if the snapshot is
+    // missing, stale, or fails the state_root cross-check. When auto_migrate
+    // is on (default), a successful full-replay fallback automatically
+    // backfills the snapshot inside `open_chain` so the next boot uses the
+    // fast path.
+    let tip = open_chain(
+        &storage,
+        &mut utxo_set,
+        &expected_genesis_id,
+        assume_valid,
+        auto_migrate,
+    )
+    .map_err(|e| {
         format!(
-            "Chain replay failed: {e}. Database may be corrupt. Delete data directory and re-sync."
+            "Chain open failed: {e}. Database may be corrupt. Delete data directory and re-sync."
         )
     })?;
 

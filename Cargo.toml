@@ -43,6 +43,7 @@ testnet = []
 allow-testnet-release = ["testnet"]  # Override compile_error for testnet in release profile. Use with extreme caution.
 testing = []  # Exposes test-only helpers (e.g. dispute_script_unchecked). Never enable in production builds.
 channels = []  # Payment channel covenant templates. Off by default.
+bench-diagnostics = []  # Phase 3a diagnostic binary (bench_phase3a). Off by default to keep the production build minimal; build with `cargo build --release --features bench-diagnostics --bin bench_phase3a` to reproduce the numbers in issue #6.
 
 [dev-dependencies]
 tempfile = "3"
@@ -76,3 +77,8 @@ path = "src/bin/covenant_test2.rs"
 [[bin]]
 name = "stress_test"
 path = "src/bin/stress_test.rs"
+
+[[bin]]
+name = "bench_phase3a"
+path = "src/bin/bench_phase3a.rs"
+required-features = ["bench-diagnostics"]

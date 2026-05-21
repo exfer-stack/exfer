@@ -1,5 +1,5 @@
 use crate::chain::fork_choice::{is_better_chain, ChainTip};
-use crate::chain::state::{UtxoEntry, UtxoSet};
+use crate::chain::state::{UtxoEntry, UtxoMutation, UtxoSet};
 use crate::chain::storage::ChainStorage;
 use crate::consensus::difficulty::expected_difficulty;
 use crate::consensus::validation::{
@@ -2452,9 +2452,12 @@ impl Node {
             if block.header.prev_block_id == current_tip.block_id {
                 // Extends current tip — validate and apply in-place (no clone).
                 // On failure the atomic function rolls back automatically.
-                // Spent UTXOs are collected incrementally during apply (captures
-                // intra-block dependency spends that don't exist pre-block).
-                let (_total_fees, spent_utxos) =
+                // The returned mutation log is the single source of truth:
+                // commit_block_atomic writes both UTXOS_TABLE (from mutations)
+                // and SPENT_UTXOS_TABLE (from the derived spent_utxos slice)
+                // inside one atomic write_txn. Commit 4 will collapse the
+                // derived slice once the undo helpers move to mutations.
+                let (_total_fees, mutations) =
                     validate_and_apply_block_transactions_atomic(&block, &mut utxo_set).map_err(
                         |e| match e {
                             ValidationError::StateCorrupted(msg) => ProcessBlockError::Fatal(
@@ -2466,6 +2469,7 @@ impl Node {
                             )),
                         },
                     )?;
+                let spent_utxos = UtxoMutation::collect_spent_utxos(&mutations);
 
                 // State root check (O(1) with incremental SMT)
                 let computed_state_root = utxo_set.state_root();
@@ -2482,11 +2486,16 @@ impl Node {
                     return Err("state root mismatch".into());
                 }
 
-                // Validation passed — atomic persist (single redb transaction)
-                if let Err(e) =
-                    self.storage
-                        .commit_block_atomic(&block, &new_tip.cumulative_work, &spent_utxos)
-                {
+                // Validation passed — atomic persist (single redb transaction).
+                // commit_block_atomic also writes UTXOS_TABLE from the same
+                // mutation log that mutated the in-memory UtxoSet, so the
+                // two views can't drift.
+                if let Err(e) = self.storage.commit_block_atomic(
+                    &block,
+                    &new_tip.cumulative_work,
+                    &spent_utxos,
+                    &mutations,
+                ) {
                     // Storage failed — undo in-memory mutations to stay consistent with disk
                     if let Err(undo_err) =
                         undo_block_transactions(&block, &mut utxo_set, &spent_utxos)
@@ -2635,6 +2644,10 @@ impl Node {
                 // 3. Apply new chain with full tx validation (oldest first)
                 new_chain.reverse();
                 let mut all_spent: Vec<(Hash256, Vec<(OutPoint, UtxoEntry)>)> = Vec::new();
+                // Per-block mutation log: aligned with new_chain order so
+                // commit_reorg_atomic can forward-apply UTXOS_TABLE writes
+                // in the same write_txn as the rest of the reorg.
+                let mut all_mutations: Vec<(Hash256, Vec<UtxoMutation>)> = Vec::new();
                 let mut new_applied = 0; // count of fully-applied new-chain blocks
 
                 let apply_err: Option<ProcessBlockError> = 'apply: {
@@ -2709,13 +2722,19 @@ impl Node {
                             }
                         }
 
-                        // Validate and apply — spent UTXOs are collected
-                        // incrementally inside (captures intra-block spends).
-                        let spent_utxos = match validate_and_apply_block_transactions_atomic(
-                            blk,
-                            &mut utxo_set,
-                        ) {
-                            Ok((_fees, spent)) => spent,
+                        // Validate and apply — mutation log captures Insert
+                        // and Remove in apply order, including intra-block
+                        // dependency spends. We stash the full log per block
+                        // for commit_reorg_atomic and derive the legacy
+                        // spent_utxos slice for undo_block_transactions /
+                        // SPENT_UTXOS_TABLE consumers.
+                        let (mutations_this_block, spent_utxos) = match
+                            validate_and_apply_block_transactions_atomic(blk, &mut utxo_set)
+                        {
+                            Ok((_fees, mutations)) => {
+                                let spent = UtxoMutation::collect_spent_utxos(&mutations);
+                                (mutations, spent)
+                            }
                             Err(ValidationError::StateCorrupted(msg)) => {
                                 // Atomic apply hit state corruption — fatal
                                 break 'apply Some(ProcessBlockError::Fatal(format!(
@@ -2750,6 +2769,7 @@ impl Node {
                         }
 
                         all_spent.push((blk.header.block_id(), spent_utxos));
+                        all_mutations.push((blk.header.block_id(), mutations_this_block));
                         new_applied += 1;
                     }
                     None
@@ -2820,7 +2840,9 @@ impl Node {
                 if let Err(e) = self.storage.commit_reorg_atomic(
                     &block,
                     &new_tip.cumulative_work,
+                    &old_chain,
                     &all_spent,
+                    &all_mutations,
                     &new_chain_heights,
                     &new_chain,
                     &new_chain_work,

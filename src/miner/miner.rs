@@ -126,7 +126,7 @@ impl Miner {
                 }
             }
             match utxo_trial.apply_transaction(tx, height) {
-                Ok(()) => {
+                Ok(_mutations) => {
                     let tx_out: u128 = tx.outputs.iter().map(|o| o.value as u128).sum();
                     applied_fees += tx_in.saturating_sub(tx_out);
                     applied_txs.push(tx.clone());

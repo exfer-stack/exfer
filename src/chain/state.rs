@@ -55,6 +55,43 @@ pub struct UtxoEntry {
     pub is_coinbase: bool,
 }
 
+/// Phase 3a — single source of truth for what `UtxoSet::apply_transaction`
+/// did. Emitted by the apply path; consumed by:
+///
+///   - on-disk persistence (commit 3 wires `commit_*_atomic` to UTXOS_TABLE),
+///   - in-memory undo on reorg (commit 4 rewires `undo_block_transactions`).
+///
+/// Both halves carry the `UtxoEntry` so undo can restore without re-fetching
+/// from disk. Order is significant: when replayed in reverse, the apply path
+/// is exactly undone (Insert → remove, Remove → insert).
+///
+/// Why an enum rather than two Vecs: the apply path naturally interleaves
+/// removes (input consumption) and inserts (output creation), and the
+/// reverse-undo path needs to preserve that order to round-trip correctly.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UtxoMutation {
+    Insert(OutPoint, UtxoEntry),
+    Remove(OutPoint, UtxoEntry),
+}
+
+impl UtxoMutation {
+    /// Collapse a mutation log into the legacy `(OutPoint, UtxoEntry)` slice
+    /// shape that today's `commit_*_atomic` / `undo_block_transactions`
+    /// consumers expect for the `spent_utxos` parameter. Kept as a thin
+    /// adapter so commit 2 can land the API cascade without touching the
+    /// downstream signatures — commit 4 refactors those consumers to take
+    /// `&[UtxoMutation]` directly and this helper goes away.
+    pub fn collect_spent_utxos(mutations: &[UtxoMutation]) -> Vec<(OutPoint, UtxoEntry)> {
+        mutations
+            .iter()
+            .filter_map(|m| match m {
+                UtxoMutation::Remove(op, e) => Some((*op, e.clone())),
+                UtxoMutation::Insert(_, _) => None,
+            })
+            .collect()
+    }
+}
+
 /// The UTXO set: maps OutPoint → UtxoEntry.
 /// Uses BTreeMap internally for deterministic ordering.
 /// Uses a Sparse Merkle Tree for state_root computation.
@@ -158,17 +195,25 @@ impl UtxoSet {
 
     /// Apply a transaction to the UTXO set.
     /// Removes spent inputs and adds new outputs.
+    /// Returns the ordered mutation log (Phase 3a) — see `UtxoMutation`.
     /// Returns Err if any input UTXO is missing or serialization fails.
-    pub fn apply_transaction(&mut self, tx: &Transaction, height: u64) -> Result<(), StateError> {
+    pub fn apply_transaction(
+        &mut self,
+        tx: &Transaction,
+        height: u64,
+    ) -> Result<Vec<UtxoMutation>, StateError> {
         let tx_id = tx.tx_id()?;
         let is_coinbase = tx.is_coinbase();
+
+        let mut mutations = Vec::with_capacity(tx.inputs.len() + tx.outputs.len());
 
         // Remove spent inputs (skip for coinbase)
         if !is_coinbase {
             for input in &tx.inputs {
                 let outpoint = OutPoint::new(input.prev_tx_id, input.output_index);
-                if self.remove(&outpoint).is_none() {
-                    return Err(StateError::InputNotFound(outpoint));
+                match self.remove(&outpoint) {
+                    Some(entry) => mutations.push(UtxoMutation::Remove(outpoint, entry)),
+                    None => return Err(StateError::InputNotFound(outpoint)),
                 }
             }
         }
@@ -176,16 +221,15 @@ impl UtxoSet {
         // Add new outputs
         for (idx, output) in tx.outputs.iter().enumerate() {
             let outpoint = OutPoint::new(tx_id, idx as u32);
-            self.insert(
-                outpoint,
-                UtxoEntry {
-                    output: output.clone(),
-                    height,
-                    is_coinbase,
-                },
-            )?;
+            let entry = UtxoEntry {
+                output: output.clone(),
+                height,
+                is_coinbase,
+            };
+            self.insert(outpoint, entry.clone())?;
+            mutations.push(UtxoMutation::Insert(outpoint, entry));
         }
-        Ok(())
+        Ok(mutations)
     }
 
     /// Undo a transaction (for reorgs). Inverse of apply_transaction.

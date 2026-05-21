@@ -1,4 +1,4 @@
-use crate::chain::state::{UtxoEntry, UtxoSet};
+use crate::chain::state::{UtxoEntry, UtxoMutation, UtxoSet};
 use crate::consensus::cost;
 use crate::script::jets::context::{ScriptContext, TxInputInfo, TxOutputInfo};
 use crate::script::{self, Combinator};
@@ -1458,21 +1458,37 @@ pub fn validate_and_apply_block_transactions(
 /// Validate and apply block transactions with automatic rollback on failure.
 ///
 /// On success: `utxo_set` has all block transactions applied, returns
-/// `(total_fees, spent_utxos)`. The `spent_utxos` list is collected
-/// incrementally during application and includes intra-block spends
-/// (outputs created and consumed within the same block).
+/// `(total_fees, mutations)`. The mutation log is the single source of
+/// truth — apply_transaction emits each Remove/Insert in apply order, and
+/// the same Vec feeds (commit 3) UTXOS_TABLE writes and (commit 4) reorg
+/// undo. Per issue #6 review: "one derivation, one source".
 ///
 /// On failure: `utxo_set` is rolled back to its pre-call state, returns error.
+///
+/// Callers that need the legacy `spent_utxos` shape (e.g. for the existing
+/// SPENT_UTXOS_TABLE writes) can derive it with:
+///
+/// ```ignore
+/// let spent_utxos: Vec<(OutPoint, UtxoEntry)> = mutations
+///     .iter()
+///     .filter_map(|m| match m {
+///         UtxoMutation::Remove(op, e) => Some((*op, e.clone())),
+///         _ => None,
+///     })
+///     .collect();
+/// ```
 pub fn validate_and_apply_block_transactions_atomic(
     block: &Block,
     utxo_set: &mut UtxoSet,
-) -> Result<(u64, Vec<(OutPoint, UtxoEntry)>), ValidationError> {
+) -> Result<(u64, Vec<UtxoMutation>), ValidationError> {
     let header = &block.header;
 
-    // Collect spent UTXOs incrementally as we apply. This captures both
-    // pre-block UTXOs and intra-block outputs (created by an earlier tx
-    // in this block and spent by a later one). Without incremental
-    // collection, undo would fail on intra-block dependency spends.
+    // Mutation log — returned to caller for both disk persistence and undo.
+    let mut mutations: Vec<UtxoMutation> = Vec::new();
+    // Internal rollback bookkeeping. Kept as `(OutPoint, UtxoEntry)` because
+    // the partial-failure undo helpers (commit 4 refactors these to consume
+    // mutations directly) still take that shape. The size-budget tally also
+    // accumulates here to bail before too much undo metadata piles up.
     let mut spent_utxos: Vec<(OutPoint, UtxoEntry)> = Vec::new();
     // Track serialized undo-metadata bytes to prevent amplification DoS:
     // block inputs are small (~36 bytes each) but the UTXOs they reference
@@ -1482,21 +1498,24 @@ pub fn validate_and_apply_block_transactions_atomic(
     let mut spent_utxos_bytes: usize = 0;
 
     // Apply coinbase outputs first (same as non-atomic path)
-    if let Err(e) = utxo_set.apply_transaction(&block.transactions[0], header.height) {
-        // Coinbase apply failed — may have partially inserted outputs.
-        // Best-effort rollback: undo_transaction removes any outputs that
-        // were inserted. If undo also fails, report both errors so the
-        // caller knows the severity of the state corruption.
-        if let Err(undo_err) = utxo_set.undo_transaction(&block.transactions[0], &[]) {
+    match utxo_set.apply_transaction(&block.transactions[0], header.height) {
+        Ok(m) => mutations.extend(m),
+        Err(e) => {
+            // Coinbase apply failed — may have partially inserted outputs.
+            // Best-effort rollback: undo_transaction removes any outputs that
+            // were inserted. If undo also fails, report both errors so the
+            // caller knows the severity of the state corruption.
+            if let Err(undo_err) = utxo_set.undo_transaction(&block.transactions[0], &[]) {
+                return Err(ValidationError::StateCorrupted(format!(
+                    "coinbase apply: {}; rollback also failed: {}",
+                    e, undo_err
+                )));
+            }
             return Err(ValidationError::StateCorrupted(format!(
-                "coinbase apply: {}; rollback also failed: {}",
-                e, undo_err
+                "coinbase apply: {}",
+                e
             )));
         }
-        return Err(ValidationError::StateCorrupted(format!(
-            "coinbase apply: {}",
-            e
-        )));
     }
     let mut applied_count: usize = 1;
 
@@ -1536,35 +1555,38 @@ pub fn validate_and_apply_block_transactions_atomic(
                         spent_utxos.push((outpoint, entry.clone()));
                     }
                 }
-                if let Err(e) = utxo_set.apply_transaction(tx, header.height) {
-                    // apply_transaction may have partially mutated state
-                    // (some inputs removed, some outputs inserted before
-                    // the error).  First undo the partial current tx, then
-                    // roll back all previously applied transactions.
-                    let tx_spent: Vec<_> = spent_utxos
-                        .iter()
-                        .filter(|(op, _)| {
-                            tx.inputs.iter().any(|i| {
-                                i.prev_tx_id == op.tx_id && i.output_index == op.output_index
+                match utxo_set.apply_transaction(tx, header.height) {
+                    Ok(m) => mutations.extend(m),
+                    Err(e) => {
+                        // apply_transaction may have partially mutated state
+                        // (some inputs removed, some outputs inserted before
+                        // the error).  First undo the partial current tx, then
+                        // roll back all previously applied transactions.
+                        let tx_spent: Vec<_> = spent_utxos
+                            .iter()
+                            .filter(|(op, _)| {
+                                tx.inputs.iter().any(|i| {
+                                    i.prev_tx_id == op.tx_id && i.output_index == op.output_index
+                                })
                             })
-                        })
-                        .cloned()
-                        .collect();
-                    if let Err(partial_err) = utxo_set.undo_partial_transaction(tx, &tx_spent) {
-                        return Err(ValidationError::StateCorrupted(format!(
-                            "tx apply: {}: partial undo failed: {}",
-                            e, partial_err
-                        )));
+                            .cloned()
+                            .collect();
+                        if let Err(partial_err) = utxo_set.undo_partial_transaction(tx, &tx_spent) {
+                            return Err(ValidationError::StateCorrupted(format!(
+                                "tx apply: {}: partial undo failed: {}",
+                                e, partial_err
+                            )));
+                        }
+                        if let Err(undo_err) =
+                            undo_applied_transactions(block, utxo_set, applied_count, &spent_utxos)
+                        {
+                            return Err(ValidationError::StateCorrupted(format!(
+                                "tx apply: {}: rollback failed: {}",
+                                e, undo_err
+                            )));
+                        }
+                        return Err(ValidationError::StateCorrupted(format!("tx apply: {}", e)));
                     }
-                    if let Err(undo_err) =
-                        undo_applied_transactions(block, utxo_set, applied_count, &spent_utxos)
-                    {
-                        return Err(ValidationError::StateCorrupted(format!(
-                            "tx apply: {}: rollback failed: {}",
-                            e, undo_err
-                        )));
-                    }
-                    return Err(ValidationError::StateCorrupted(format!("tx apply: {}", e)));
                 }
                 applied_count += 1;
             }
@@ -1623,7 +1645,7 @@ pub fn validate_and_apply_block_transactions_atomic(
         return Err(e);
     }
 
-    Ok((total_fees, spent_utxos))
+    Ok((total_fees, mutations))
 }
 
 /// Apply a block's transactions to `utxo_set` WITHOUT validating signatures
@@ -1652,24 +1674,28 @@ pub fn validate_and_apply_block_transactions_atomic(
 pub fn apply_block_transactions_assume_valid(
     block: &Block,
     utxo_set: &mut UtxoSet,
-) -> Result<(u64, Vec<(OutPoint, UtxoEntry)>), ValidationError> {
+) -> Result<(u64, Vec<UtxoMutation>), ValidationError> {
     let header = &block.header;
 
+    let mut mutations: Vec<UtxoMutation> = Vec::new();
     let mut spent_utxos: Vec<(OutPoint, UtxoEntry)> = Vec::new();
     let mut spent_utxos_bytes: usize = 0;
 
     // Coinbase first — identical rollback handling to the validated path.
-    if let Err(e) = utxo_set.apply_transaction(&block.transactions[0], header.height) {
-        if let Err(undo_err) = utxo_set.undo_transaction(&block.transactions[0], &[]) {
+    match utxo_set.apply_transaction(&block.transactions[0], header.height) {
+        Ok(m) => mutations.extend(m),
+        Err(e) => {
+            if let Err(undo_err) = utxo_set.undo_transaction(&block.transactions[0], &[]) {
+                return Err(ValidationError::StateCorrupted(format!(
+                    "coinbase apply: {}; rollback also failed: {}",
+                    e, undo_err
+                )));
+            }
             return Err(ValidationError::StateCorrupted(format!(
-                "coinbase apply: {}; rollback also failed: {}",
-                e, undo_err
+                "coinbase apply: {}",
+                e
             )));
         }
-        return Err(ValidationError::StateCorrupted(format!(
-            "coinbase apply: {}",
-            e
-        )));
     }
     let mut applied_count: usize = 1;
 
@@ -1742,24 +1768,27 @@ pub fn apply_block_transactions_assume_valid(
         };
         total_fees = total_fees.saturating_add(fee);
 
-        if let Err(e) = utxo_set.apply_transaction(tx, header.height) {
-            // Same partial-rollback dance as validated path.
-            let tx_spent: Vec<_> = spent_utxos[tx_spent_start..].to_vec();
-            if let Err(partial_err) = utxo_set.undo_partial_transaction(tx, &tx_spent) {
-                return Err(ValidationError::StateCorrupted(format!(
-                    "tx apply: {}: partial undo failed: {}",
-                    e, partial_err
-                )));
+        match utxo_set.apply_transaction(tx, header.height) {
+            Ok(m) => mutations.extend(m),
+            Err(e) => {
+                // Same partial-rollback dance as validated path.
+                let tx_spent: Vec<_> = spent_utxos[tx_spent_start..].to_vec();
+                if let Err(partial_err) = utxo_set.undo_partial_transaction(tx, &tx_spent) {
+                    return Err(ValidationError::StateCorrupted(format!(
+                        "tx apply: {}: partial undo failed: {}",
+                        e, partial_err
+                    )));
+                }
+                if let Err(undo_err) =
+                    undo_applied_transactions(block, utxo_set, applied_count, &spent_utxos)
+                {
+                    return Err(ValidationError::StateCorrupted(format!(
+                        "tx apply: {}: rollback failed: {}",
+                        e, undo_err
+                    )));
+                }
+                return Err(ValidationError::StateCorrupted(format!("tx apply: {}", e)));
             }
-            if let Err(undo_err) =
-                undo_applied_transactions(block, utxo_set, applied_count, &spent_utxos)
-            {
-                return Err(ValidationError::StateCorrupted(format!(
-                    "tx apply: {}: rollback failed: {}",
-                    e, undo_err
-                )));
-            }
-            return Err(ValidationError::StateCorrupted(format!("tx apply: {}", e)));
         }
         applied_count += 1;
     }
@@ -1777,7 +1806,7 @@ pub fn apply_block_transactions_assume_valid(
     }
     let total_fees = total_fees as u64;
 
-    Ok((total_fees, spent_utxos))
+    Ok((total_fees, mutations))
 }
 
 /// Undo `applied_count` transactions from the front of `block.transactions`
@@ -2005,7 +2034,8 @@ mod tests {
         };
         let block = make_block_with(next_height, vec![cb_next, spend], Hash256::ZERO);
 
-        let (fees, spent) = apply_block_transactions_assume_valid(&block, &mut utxo).unwrap();
+        let (fees, mutations) = apply_block_transactions_assume_valid(&block, &mut utxo).unwrap();
+        let spent = UtxoMutation::collect_spent_utxos(&mutations);
 
         assert_eq!(fees, fee_amount);
         assert_eq!(spent.len(), 1, "exactly one input consumed");
@@ -2206,9 +2236,12 @@ mod tests {
         };
         let block = make_block_with(block_height, vec![cb_at_block, tx_a, tx_b], Hash256::ZERO);
 
-        let (fees_v, spent_v) =
+        let (fees_v, mutations_v) =
             validate_and_apply_block_transactions_atomic(&block, &mut utxo_v).unwrap();
-        let (fees_a, spent_a) = apply_block_transactions_assume_valid(&block, &mut utxo_a).unwrap();
+        let (fees_a, mutations_a) =
+            apply_block_transactions_assume_valid(&block, &mut utxo_a).unwrap();
+        let spent_a = UtxoMutation::collect_spent_utxos(&mutations_a);
+        let spent_v = UtxoMutation::collect_spent_utxos(&mutations_v);
 
         assert_eq!(fees_v, total_fees);
         assert_eq!(fees_a, fees_v);
@@ -2217,6 +2250,8 @@ mod tests {
         // pre-block (the funding coinbase) and one intra-block (tx_A → tx_B).
         assert_eq!(spent_a.len(), 2);
         assert_eq!(spent_a, spent_v, "spent_utxos (incl. intra-block) must match");
+        // Stronger invariant: the full mutation logs (incl. Inserts) match too.
+        assert_eq!(mutations_a, mutations_v, "mutation logs must match");
         assert_eq!(
             utxo_a.state_root(),
             utxo_v.state_root(),

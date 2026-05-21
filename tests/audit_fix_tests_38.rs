@@ -356,7 +356,7 @@ fn retained_canonical_not_deleted() {
     storage.store_fork_block_atomic(&block, &work).unwrap();
 
     // Promote to canonical via commit_genesis_atomic (sets height index + tip)
-    storage.commit_genesis_atomic(&block, &work).unwrap();
+    storage.commit_genesis_atomic(&block, &work, &[]).unwrap();
 
     // Evict — should detect canonical and preserve data
     storage.evict_fork_block(&block_id).unwrap();
