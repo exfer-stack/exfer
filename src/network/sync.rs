@@ -6559,6 +6559,13 @@ pub async fn run_sync_manager(node: Arc<Node>, mut rx: mpsc::Receiver<PeerEvent>
     let mut last_tip_poll = Instant::now();
     let mut ever_had_peer = false;
     let start_time = Instant::now();
+    // Throttle for the "no IBD candidate but peers connected" diagnostic
+    // log. We only emit one breakdown every NO_IBD_DIAG_PERIOD seconds so
+    // a sustained wedge doesn't drown the log stream, but the operator
+    // still gets a periodic snapshot of WHY no peer is currently eligible
+    // for IBD selection.
+    let mut last_no_ibd_diag: Option<Instant> = None;
+    const NO_IBD_DIAG_PERIOD_SECS: u64 = 300;
 
     node.sync_state
         .store(SyncState::CatchingUp as u8, Ordering::Relaxed);
@@ -6850,6 +6857,68 @@ pub async fn run_sync_manager(node: Arc<Node>, mut rx: mpsc::Receiver<PeerEvent>
             )
         };
 
+        // Diagnostic: if we have connected peers but no IBD candidate, dump
+        // per-peer eligibility every NO_IBD_DIAG_PERIOD_SECS so the wedge
+        // is observable. Without this, a stuck supervisor looks identical
+        // to "node working fine, just no peer ahead" — and the wedges we
+        // hit on fly.io were invisible until we read source code paths.
+        if should_ibd.is_none() && connected_count > 0 {
+            let now_inst = Instant::now();
+            let emit = match last_no_ibd_diag {
+                Some(t) => now_inst.duration_since(t).as_secs() >= NO_IBD_DIAG_PERIOD_SECS,
+                None => true,
+            };
+            if emit {
+                let breakdown = {
+                    let peers = node.peers.lock().await;
+                    let our_tip = node.tip.read().await.clone();
+                    let now = std::time::Instant::now();
+                    let mut rows: Vec<String> = Vec::new();
+                    for (id, lp) in &peers.by_identity {
+                        if lp.session.is_none() {
+                            continue;
+                        }
+                        let tip_str = match &lp.tip {
+                            None => "tip=none".to_string(),
+                            Some(t) => format!(
+                                "tip_h={} conf={} cw_gt={}",
+                                t.height,
+                                t.confirmed,
+                                t.cumulative_work > our_tip.cumulative_work
+                            ),
+                        };
+                        let cd = match lp.ibd_cooldown_until {
+                            None => "ok".to_string(),
+                            Some(until) if now >= until => "ok".to_string(),
+                            Some(until) => {
+                                format!("{}s", until.duration_since(now).as_secs())
+                            }
+                        };
+                        rows.push(format!(
+                            "{:?} ever_ibd={} cooldown={} {}",
+                            &id[..4],
+                            lp.ever_confirmed_for_ibd,
+                            cd,
+                            tip_str
+                        ));
+                    }
+                    rows
+                };
+                info!(
+                    "Sync manager: no IBD candidate among {} connected peer(s) — eligibility breakdown:",
+                    connected_count
+                );
+                for row in breakdown {
+                    info!("  {}", row);
+                }
+                last_no_ibd_diag = Some(now_inst);
+            }
+        } else {
+            // Reset throttle so the next stuck period emits immediately
+            // instead of waiting out the full window.
+            last_no_ibd_diag = None;
+        }
+
         if let Some((peer_identity, peer_session_id)) = should_ibd {
             // v1.6.0 Fix 1: install IBD protection atomically with the
             // inbound-eviction critical section. The eviction path snapshots
@@ -6887,6 +6956,37 @@ pub async fn run_sync_manager(node: Arc<Node>, mut rx: mpsc::Receiver<PeerEvent>
                     info!("Sync manager: IBD complete");
                     last_tip_height = node.tip.read().await.height;
                     last_tip_change = Instant::now();
+
+                    // Successful IBD = proof-of-chain by delivery. The peer
+                    // streamed valid headers + blocks all the way to our new
+                    // tip; that's stronger evidence than any subsequent
+                    // tip-claim verification.
+                    //
+                    // Set `ever_confirmed_for_ibd` unconditionally now, BEFORE
+                    // the post-IBD GetTip confirmation. The GetTip confirmation
+                    // below cannot succeed when the peer's new tip is ABOVE
+                    // ours: `get_block_id_by_height(higher_height)` returns
+                    // None (we haven't stored that block yet), so `confirmed`
+                    // resolves false and the sticky flag never gets set
+                    // through that path. Without the sticky flag the peer
+                    // becomes ineligible for the next IBD attempt (see
+                    // `should_ibd` eligibility check), and if all other peers
+                    // have `tip.confirmed=false` (e.g. tip-validation
+                    // deadlines), the sync manager wedges with no IBD
+                    // candidate at all — exactly the post-PR#11 follow-up
+                    // wedge observed on fly.io at h=605,658.
+                    {
+                        let mut peers = node.peers.lock().await;
+                        if let Some(lp) = peers.get_mut_by_identity(&peer_identity) {
+                            if !lp.ever_confirmed_for_ibd {
+                                info!(
+                                    "Sync manager: promoting peer {:?} to ever_confirmed_for_ibd=true after successful IBD delivery",
+                                    &peer_identity[..4]
+                                );
+                                lp.ever_confirmed_for_ibd = true;
+                            }
+                        }
+                    }
 
                     // Immediately confirm the sync peer via GetTip
                     if node
