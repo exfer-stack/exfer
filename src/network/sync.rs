@@ -6546,6 +6546,41 @@ pub async fn run_outbound_manager(node: Arc<Node>) {
 /// - **MiningReady** (not a stored state): Live AND our tip's cumulative work
 ///   >= best confirmed peer's work. Only state where mining runs.
 ///
+/// Pure eligibility predicate for `should_ibd` peer selection.
+///
+/// Normal path: a peer is an IBD candidate if it has been confirmed
+/// (either currently via `tip.confirmed`, or via the sticky
+/// `ever_confirmed_for_ibd` flag from a prior successful proof path),
+/// is past its IBD cooldown, AND claims a chain with more cumulative
+/// work than ours.
+///
+/// Wedge fallback (`wedge_fallback_eligible == true`): when no peer
+/// has EVER been observed confirmed in this process and the
+/// supervisor has been running for at least
+/// `IBD_NO_CONFIRMED_FALLBACK_SECS`, the confirmation requirement is
+/// relaxed — a peer whose claimed chain is `cw_better` (more
+/// cumulative work than ours) qualifies even without confirmation.
+/// Diagnosed live on fly.io post-v1.11.1: 24 k-header gap with
+/// background tip-validation deadline-exceeding for every peer →
+/// `should_ibd == None` indefinitely despite 8 connected peers all
+/// reporting `cw_gt=true`. Safe to relax because every block inside
+/// `run_ibd` is PoW-validated at full Argon2id rate; a peer lying
+/// about cumulative_work gets cooldown'd as soon as their headers
+/// fail expected-difficulty.
+///
+/// Cooldown and chain-better gates apply in both paths.
+fn is_eligible_ibd_candidate(
+    tip_confirmed: bool,
+    ever_confirmed_for_ibd: bool,
+    cooldown_ok: bool,
+    cw_better: bool,
+    wedge_fallback_eligible: bool,
+) -> bool {
+    let confirmation_ok =
+        tip_confirmed || ever_confirmed_for_ibd || (wedge_fallback_eligible && cw_better);
+    confirmation_ok && cooldown_ok && cw_better
+}
+
 /// Transition rules (work-based, not height-based):
 /// - CatchingUp → Live: confirmed peer exists AND (our work >= peer's work
 ///   OR recent tip progress).
@@ -6559,6 +6594,25 @@ pub async fn run_sync_manager(node: Arc<Node>, mut rx: mpsc::Receiver<PeerEvent>
     let mut last_tip_poll = Instant::now();
     let mut ever_had_peer = false;
     let start_time = Instant::now();
+
+    // Wedge fallback state. The supervisor's strict
+    // `tip.confirmed || ever_confirmed_for_ibd` eligibility gate produces a
+    // permanent no-candidate state whenever background tip-validation can't
+    // complete (live observation on `exfer-node-stack` post-v1.11.1: 24 k-
+    // header gap, 20/sec global Argon2 rate cap → ~1200 s expected work, but
+    // 7200 s deadline keeps timing out on the network leg with no peer ever
+    // crossing into `confirmed=true`). When that happens AND no peer has
+    // EVER been observed confirmed in this process AND we've been running
+    // for at least `IBD_NO_CONFIRMED_FALLBACK_SECS`, we relax the gate to
+    // allow IBD against the highest-`cumulative_work` peer claim — see
+    // `is_eligible_ibd_candidate` for the precise rule. Safe because
+    // `run_ibd` PoW-verifies every block at full Argon2id rate; a peer
+    // lying about cumulative_work gets cooldown'd as soon as their headers
+    // fail expected-difficulty or PoW. Resets to "confirmed observed" the
+    // moment any peer flips to `tip.confirmed=true`, so a healthy node
+    // never enters the relaxed path.
+    let mut last_any_peer_confirmed: Option<Instant> = None;
+    const IBD_NO_CONFIRMED_FALLBACK_SECS: u64 = 600;
 
     node.sync_state
         .store(SyncState::CatchingUp as u8, Ordering::Relaxed);
@@ -6770,6 +6824,17 @@ pub async fn run_sync_manager(node: Arc<Node>, mut rx: mpsc::Receiver<PeerEvent>
             }
         }
 
+        // Wedge-fallback gate computed BEFORE the per-peer scan so the
+        // per-peer eligibility check can read it uniformly. The condition is
+        // "no peer has EVER been observed confirmed in this process" AND
+        // "we've been running for at least IBD_NO_CONFIRMED_FALLBACK_SECS".
+        // The state variable `last_any_peer_confirmed` is updated at the END
+        // of the scan once we've recomputed `best_confirmed_work`; if any
+        // peer is currently confirmed we reset the gate so a healthy node
+        // never falls into the relaxed selection path.
+        let wedge_fallback_eligible = last_any_peer_confirmed.is_none()
+            && start_time.elapsed() >= Duration::from_secs(IBD_NO_CONFIRMED_FALLBACK_SECS);
+
         // Derive all state from registry.by_identity
         let (_best_known_tip, best_confirmed_work, connected_count, should_ibd) = {
             let peers = node.peers.lock().await;
@@ -6808,31 +6873,22 @@ pub async fn run_sync_manager(node: Arc<Node>, mut rx: mpsc::Receiver<PeerEvent>
                     best_conf_work = tip.cumulative_work;
                 }
 
-                // IBD candidate check — only confirmed peers can trigger IBD.
-                // Unconfirmed handshake tips are just claims; a malicious peer
-                // can claim any height/work to suppress mining.
-                //
-                // v1.10.1: also accept peers that were previously proven via an
-                // on-chain proof path (sticky `ever_confirmed_for_ibd`). This
-                // closes the cold-bootstrap hang where the only proven peer's
-                // session drop deterministically clears `tip.confirmed` on
-                // reconnect (`attach_session()` at sync.rs:570–573), trapping
-                // the supervisor with no eligible IBD candidate.
-                if !tip.confirmed && !lp.ever_confirmed_for_ibd {
-                    continue;
-                }
                 let cooldown_ok = lp
                     .ibd_cooldown_until
                     .map_or(true, |until| now >= until);
-                if !cooldown_ok {
-                    continue;
-                }
                 let peer_ct = ChainTip {
                     block_id: tip.block_id,
                     height: tip.height,
                     cumulative_work: tip.cumulative_work,
                 };
-                if is_better_chain(&peer_ct, &our_tip) {
+                let cw_better = is_better_chain(&peer_ct, &our_tip);
+                if is_eligible_ibd_candidate(
+                    tip.confirmed,
+                    lp.ever_confirmed_for_ibd,
+                    cooldown_ok,
+                    cw_better,
+                    wedge_fallback_eligible,
+                ) {
                     let is_best_ibd = best_ibd.as_ref().map_or(true, |(_, _, bt)| {
                         tip.cumulative_work > bt.cumulative_work
                     });
@@ -6849,6 +6905,20 @@ pub async fn run_sync_manager(node: Arc<Node>, mut rx: mpsc::Receiver<PeerEvent>
                 best_ibd.map(|(id, sid, _)| (id, sid)),
             )
         };
+
+        // Latch "at least one peer has been confirmed". Once any peer has
+        // ever crossed into `tip.confirmed=true`, the wedge fallback is
+        // permanently disabled for this process lifetime — the
+        // `ever_confirmed_for_ibd` sticky flag carries forward as the
+        // long-lived candidacy path. Re-arms only after a full process
+        // restart.
+        if best_confirmed_work != [0u8; 32] && last_any_peer_confirmed.is_none() {
+            last_any_peer_confirmed = Some(Instant::now());
+            info!(
+                "Sync manager: first confirmed peer observed — wedge fallback path \
+                 disarmed for this process lifetime"
+            );
+        }
 
         if let Some((peer_identity, peer_session_id)) = should_ibd {
             // v1.6.0 Fix 1: install IBD protection atomically with the
@@ -6887,6 +6957,40 @@ pub async fn run_sync_manager(node: Arc<Node>, mut rx: mpsc::Receiver<PeerEvent>
                     info!("Sync manager: IBD complete");
                     last_tip_height = node.tip.read().await.height;
                     last_tip_change = Instant::now();
+
+                    // Successful `run_ibd` = proof-of-chain by delivery. The
+                    // peer streamed valid headers + blocks all the way to
+                    // our new tip; every one was PoW-validated, every
+                    // intra-block check passed. That's a stronger signal
+                    // than any post-IBD `TipResponse` claim, and we promote
+                    // the peer's sticky flag immediately so subsequent IBD
+                    // attempts can pick them up regardless of whether the
+                    // GetTip handshake below succeeds.
+                    //
+                    // Pairs with the wedge-fallback path in
+                    // `is_eligible_ibd_candidate`: once that path lets a
+                    // first IBD complete, this flag ensures we never need
+                    // to fall back through it again — the normal
+                    // `ever_confirmed_for_ibd` route covers all subsequent
+                    // attempts.
+                    //
+                    // The legacy `if confirmed { lp.ever_confirmed_for_ibd
+                    // = true; }` set in the GetTip handler below is left
+                    // alone — it provides an independent confirmation path
+                    // when the peer's tip happens to be in our storage,
+                    // and is a no-op if we've already flipped the flag here.
+                    {
+                        let mut peers = node.peers.lock().await;
+                        if let Some(lp) = peers.get_mut_by_identity(&peer_identity) {
+                            if !lp.ever_confirmed_for_ibd {
+                                info!(
+                                    "Sync manager: promoting peer {:?} to ever_confirmed_for_ibd=true after successful IBD delivery",
+                                    &peer_identity[..4]
+                                );
+                                lp.ever_confirmed_for_ibd = true;
+                            }
+                        }
+                    }
 
                     // Immediately confirm the sync peer via GetTip
                     if node
@@ -8086,6 +8190,112 @@ pub async fn run_tip_forward_validation(
 }
 
 // ── v1.6.0 Fix 1 redesign: unit tests for utility-based eviction ──
+#[cfg(test)]
+mod ibd_eligibility_tests {
+    //! Pin the `is_eligible_ibd_candidate` decision tree, including the new
+    //! wedge-fallback path added to break the catch-22 observed live on
+    //! `exfer-node-stack` post-v1.11.1 (no peer ever crosses
+    //! `tip.confirmed=true` because background tip-validation deadline-
+    //! exceeds on a 24 k-header gap → `should_ibd` returns `None` for
+    //! hours → the chain stops advancing).
+
+    use super::is_eligible_ibd_candidate;
+
+    // ── Normal path: confirmed peer eligible ───────────────────────────
+
+    #[test]
+    fn confirmed_peer_with_better_chain_and_no_cooldown_is_eligible() {
+        // The healthy steady-state case: peer's tip is confirmed,
+        // their chain is better, no cooldown.
+        assert!(is_eligible_ibd_candidate(
+            /* tip_confirmed */ true,
+            /* ever_confirmed_for_ibd */ false,
+            /* cooldown_ok */ true,
+            /* cw_better */ true,
+            /* wedge_fallback_eligible */ false,
+        ));
+    }
+
+    #[test]
+    fn ever_confirmed_sticky_peer_is_eligible_without_current_confirmation() {
+        // v1.10.1's sticky flag: a peer that was confirmed earlier in the
+        // process stays eligible even after a reconnect clears
+        // `tip.confirmed`.
+        assert!(is_eligible_ibd_candidate(
+            false, true, true, true, false,
+        ));
+    }
+
+    #[test]
+    fn cooldown_blocks_otherwise_eligible_peer() {
+        // Even with confirmation and better chain, a peer in cooldown is
+        // skipped — this is what prevents a striked peer from being
+        // re-tried instantly after run_ibd failure.
+        assert!(!is_eligible_ibd_candidate(
+            true, true, /* cooldown_ok */ false, true, false,
+        ));
+    }
+
+    #[test]
+    fn no_better_chain_means_no_candidate_regardless_of_confirmation() {
+        // If the peer's chain is NOT better (we're already at their tip
+        // or ahead), there's nothing to IBD even if everything else
+        // looks healthy. Mining stays unsuppressed.
+        assert!(!is_eligible_ibd_candidate(
+            true, true, true, /* cw_better */ false, false,
+        ));
+    }
+
+    #[test]
+    fn unconfirmed_peer_without_fallback_is_ineligible() {
+        // The pre-fix behavior: peer claims better chain but is neither
+        // currently confirmed nor sticky-confirmed → skipped. This is
+        // what produced the wedge documented in the commit body.
+        assert!(!is_eligible_ibd_candidate(
+            false, false, true, true, /* wedge_fallback_eligible */ false,
+        ));
+    }
+
+    // ── Wedge-fallback path: new behavior under this commit ────────────
+
+    #[test]
+    fn wedge_fallback_accepts_unconfirmed_peer_with_better_chain() {
+        // THE regression test for the live wedge. Pre-fix: this
+        // returned false (no eligible peer, supervisor idles forever).
+        // Post-fix: `wedge_fallback_eligible=true` lets the unconfirmed
+        // peer's better-chain claim qualify, so the supervisor can pick
+        // them for IBD and break the deadlock.
+        assert!(is_eligible_ibd_candidate(
+            /* tip_confirmed */ false,
+            /* ever_confirmed_for_ibd */ false,
+            /* cooldown_ok */ true,
+            /* cw_better */ true,
+            /* wedge_fallback_eligible */ true,
+        ));
+    }
+
+    #[test]
+    fn wedge_fallback_does_not_relax_cooldown() {
+        // The fallback only relaxes confirmation — a peer that just
+        // failed run_ibd and is in cooldown must still wait the
+        // cooldown out before being retried, regardless of how stuck
+        // the supervisor is.
+        assert!(!is_eligible_ibd_candidate(
+            false, false, /* cooldown_ok */ false, true, true,
+        ));
+    }
+
+    #[test]
+    fn wedge_fallback_does_not_promote_non_better_chain() {
+        // Fallback gives the better-chain peer a chance; it does NOT
+        // suddenly accept peers whose chain is not better. The whole
+        // point of fork-choice is unchanged.
+        assert!(!is_eligible_ibd_candidate(
+            false, false, true, /* cw_better */ false, true,
+        ));
+    }
+}
+
 #[cfg(test)]
 mod ancestor_probe_tests {
     //! Pin the over-delivery tolerance fix for ancestor probes.
