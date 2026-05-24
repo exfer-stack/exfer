@@ -7176,15 +7176,23 @@ pub async fn run_sync_manager(node: Arc<Node>, mut rx: mpsc::Receiver<PeerEvent>
                                         dispatched_async = true;
                                         break;
                                     }
-                                    // v1.9.2 site 1: max_count=1 was requested; anything else is
-                                    // a protocol violation. Bail with verified=false /
-                                    // dispatched_async=false so the post-loop strike branch fires.
-                                    if headers.len() != 1 {
-                                        warn!(
-                                            "Peer {:?} returned {} headers for max_count=1 tip-followup at height {} — malformed",
+                                    // v1.11.1: `max_count = 1` is an upper
+                                    // bound, not a hard contract — pre-v1.9.2
+                                    // peers ignore it and reply with up to
+                                    // `MAX_GETBLOCKS_ITEMS = 64` headers in a
+                                    // single batch. The tip-followup only
+                                    // consumes `headers[0]`, so over-delivery
+                                    // is informational; we keep the bind-to-
+                                    // claimed-tip checks on hdrs[0] and
+                                    // ignore the extras. Same wedge class as
+                                    // the ancestor-probe sites (see helper
+                                    // `interpret_ancestor_probe_response`
+                                    // and ancestor_probe_tests).
+                                    if headers.len() > 1 {
+                                        debug!(
+                                            "Peer {:?} returned {} headers for max_count=1 tip-followup at height {} — using hdrs[0], ignoring extras",
                                             &from_identity[..4], headers.len(), height
                                         );
-                                        break;
                                     }
                                     if let Some(header) = headers.first() {
                                         let hdr_block_id = header.block_id();
