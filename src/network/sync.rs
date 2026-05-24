@@ -4630,6 +4630,10 @@ impl Node {
     }
 
     /// Check if we share the same block at the given height with a peer.
+    ///
+    /// Delegates the post-receive header-list interpretation to
+    /// [`interpret_ancestor_probe_response`] so the I/O-free logic is
+    /// unit-testable.
     async fn check_shared_block_via_events(
         &self,
         peer_identity: PeerId,
@@ -4646,34 +4650,11 @@ impl Node {
             return Err("failed to send to peer".into());
         }
         let headers = recv_ibd_headers(self, rx, peer_identity, session_id, deadline).await?;
-        // v1.9.2 site 7: max_count=1 IBD ancestor probe.
-        //   empty   → Ok(None); peer rate-limited or has no data, no strike.
-        //   len > 1 → Err("returned N headers..."); IBD path treats as cooldown,
-        //             no strike (no IBD-side strike plumbing in v1.9.2; deferred
-        //             to v1.9.3 follow-up).
-        //   wrong h → Err propagated (already).
-        if headers.is_empty() {
-            return Ok(None);
-        }
-        if headers.len() != 1 {
-            return Err(format!(
-                "ancestor probe at height {} returned {} headers, expected 1",
-                height,
-                headers.len()
-            ));
-        }
-        if headers[0].height != height {
-            return Err(format!(
-                "peer returned height {} but expected {}",
-                headers[0].height, height
-            ));
-        }
-        let peer_block_id = headers[0].block_id();
-        match self.storage.get_block_id_by_height(height) {
-            Ok(Some(our_block_id)) => Ok(Some(our_block_id == peer_block_id)),
-            Ok(None) => Ok(None),
-            Err(e) => Err(e.to_string()),
-        }
+        let our_block_id_at_height = self
+            .storage
+            .get_block_id_by_height(height)
+            .map_err(|e| e.to_string())?;
+        interpret_ancestor_probe_response(&headers, height, our_block_id_at_height)
     }
 
     /// Find common ancestor between our chain and a peer using binary search.
@@ -4732,6 +4713,49 @@ impl Node {
         }
         Ok(lo)
     }
+}
+
+/// Pure logic: interpret a peer's `Headers` response for an ancestor probe.
+///
+/// `headers` is whatever the peer delivered for a `GetHeaders(start_height,
+/// max_count=1)` request. The probe's contract is "tell me what block is at
+/// `expected_height`", so only `headers[0]` is consumed; extras are
+/// informational (pre-v1.9.2 peers ignore `max_count` and reply with up to
+/// `MAX_GETBLOCKS_ITEMS = 64` headers in a single batch). Striking on extras
+/// is what wedged IBD on the live fly.io repro — once the only
+/// `ever_confirmed_for_ibd=true` peer ate enough strikes to drop, the sync
+/// manager had no IBD candidate left and the chain froze.
+///
+/// Returns:
+/// * `Ok(None)`         — peer delivered no headers (rate-limited / has no
+///                        data at this height); caller treats as "skip this
+///                        probe, retry later", no strike.
+/// * `Ok(Some(true))`   — peer's header at `expected_height` matches the
+///                        block we have in storage; ancestor confirmed.
+/// * `Ok(Some(false))`  — peer's header at `expected_height` differs from
+///                        ours; binary search continues / fork detected.
+/// * `Err(_)`           — `headers[0].height` is wrong, which is a real
+///                        protocol violation (the one header we consume is
+///                        unusable).
+fn interpret_ancestor_probe_response(
+    headers: &[BlockHeader],
+    expected_height: u64,
+    our_block_id_at_height: Option<Hash256>,
+) -> Result<Option<bool>, String> {
+    if headers.is_empty() {
+        return Ok(None);
+    }
+    if headers[0].height != expected_height {
+        return Err(format!(
+            "peer returned height {} for hdrs[0] but expected {} \
+             (response carried {} headers — first one used)",
+            headers[0].height,
+            expected_height,
+            headers.len()
+        ));
+    }
+    let peer_block_id = headers[0].block_id();
+    Ok(our_block_id_at_height.map(|our| our == peer_block_id))
 }
 
 /// Receive a HeadersResponse from a specific peer+session via the event channel.
@@ -7693,37 +7717,41 @@ pub async fn run_tip_forward_validation(
             };
             // v1.9.2 site 3: max_count=1 initial ancestor probe at clamped
             // height (≤ claim_height).
-            //   empty   → PeerNoForwardData (bail no-strike); rate-limited.
-            //   len > 1 → DeliveredInvalidHeader (strike); protocol violation.
-            //   wrong h → DeliveredInvalidHeader (strike); protocol violation.
-            //   match   → anchor at clamped probe height (no fork below).
-            //   diverge → fall into binary search.
-            if hdrs.is_empty() {
-                return Err(TipValidationError::PeerNoForwardData(format!(
-                    "empty response to ancestor probe at clamped height {} \
-                     (our_height_start={}, claim_height={})",
-                    our_height, our_height_start, claim_height
-                )));
-            }
-            if hdrs.len() != 1 {
-                return Err(TipValidationError::DeliveredInvalidHeader(format!(
-                    "ancestor probe at height {} returned {} headers, expected 1",
-                    our_height,
-                    hdrs.len()
-                )));
-            }
-            if hdrs[0].height != our_height {
-                return Err(TipValidationError::DeliveredInvalidHeader(format!(
-                    "ancestor probe returned height {}, expected {}",
-                    hdrs[0].height, our_height
-                )));
-            }
-            let anchor_at_clamped_probe = node
-                .storage
-                .get_block_id_by_height(our_height)
-                .ok()
-                .flatten()
-                == Some(hdrs[0].block_id());
+            //   empty       → PeerNoForwardData (bail no-strike); rate-limited.
+            //   first wrong → DeliveredInvalidHeader (strike); the only header
+            //                 we use is `hdrs[0]`, so an incorrect height there
+            //                 is a real protocol-level violation.
+            //   over-deliver (hdrs.len() > 1) → tolerated. `max_count` is an
+            //                 upper bound, not a hard contract: pre-v1.9.2
+            //                 peers ignored it and replied with up to
+            //                 `MAX_GETBLOCKS_ITEMS = 64` headers. Striking on
+            //                 over-delivery causes a wedge: each ancestor
+            //                 probe immediately strikes the IBD peer,
+            //                 disconnects them, and when that peer was the
+            //                 only `ever_confirmed_for_ibd=true` candidate
+            //                 the sync manager has no eligible IBD peer left
+            //                 (the chain stops advancing — see
+            //                 docs/v1.11.x-stuck-ibd-postmortem.md for the
+            //                 fly.io reproduction at h=605,656). We use
+            //                 hdrs[0] only and ignore the extras.
+            //   match       → anchor at clamped probe height (no fork below).
+            //   diverge     → fall into binary search.
+            let our_bid_at_clamp =
+                node.storage.get_block_id_by_height(our_height).ok().flatten();
+            let anchor_at_clamped_probe =
+                match interpret_ancestor_probe_response(&hdrs, our_height, our_bid_at_clamp) {
+                    Ok(Some(b)) => b,
+                    Ok(None) => {
+                        return Err(TipValidationError::PeerNoForwardData(format!(
+                            "empty response to ancestor probe at clamped height {} \
+                             (our_height_start={}, claim_height={})",
+                            our_height, our_height_start, claim_height
+                        )));
+                    }
+                    Err(msg) => {
+                        return Err(TipValidationError::DeliveredInvalidHeader(msg));
+                    }
+                };
             let ancestor_h = if anchor_at_clamped_probe {
                 our_height
             } else {
@@ -7742,37 +7770,42 @@ pub async fn run_tip_forward_validation(
                     }
                     let hdrs = await_header_batch(&mut subscriber).await?;
                     // v1.9.2 site 4: max_count=1 ancestor midpoint probe.
-                    // Bounds clamped above, so mid ≤ claim_height; empty here
-                    // is unambiguously rate-limited / no-data.
-                    //   empty   → PeerNoForwardData (bail no-strike).
-                    //   len > 1 → DeliveredInvalidHeader (strike).
-                    //   wrong h → DeliveredInvalidHeader (strike).
-                    //   match   → lo = mid (continue search up).
-                    //   diverge → hi = mid - 1 (continue search down, no strike).
-                    if hdrs.is_empty() {
-                        return Err(TipValidationError::PeerNoForwardData(format!(
-                            "empty response to ancestor midpoint probe at height {}",
-                            mid
-                        )));
-                    }
-                    if hdrs.len() != 1 {
-                        return Err(TipValidationError::DeliveredInvalidHeader(format!(
-                            "ancestor midpoint probe at height {} returned {} headers, expected 1",
-                            mid,
-                            hdrs.len()
-                        )));
-                    }
-                    if hdrs[0].height != mid {
-                        return Err(TipValidationError::DeliveredInvalidHeader(format!(
-                            "ancestor midpoint probe returned height {}, expected {}",
-                            hdrs[0].height, mid
-                        )));
-                    }
-                    let peer_bid = hdrs[0].block_id();
-                    let our_bid = node.storage.get_block_id_by_height(mid).ok().flatten();
-                    match our_bid {
-                        Some(o) if o == peer_bid => lo = mid,
-                        _ => hi = mid.saturating_sub(1),
+                    // Delegates to `interpret_ancestor_probe_response` so this
+                    // probe gets the same over-delivery tolerance as the
+                    // initial-probe + IBD-side sites (review of PR#11 caught
+                    // that this midpoint inlined its own `len != 1` reject
+                    // and was the missing third site in the same wedge
+                    // class). Mapping:
+                    //   helper Ok(None)        — peer empty or our storage
+                    //                            missing (unreachable here,
+                    //                            since `mid` is within
+                    //                            [lo, hi] of validated chain;
+                    //                            still bail no-strike if it
+                    //                            happens).
+                    //   helper Ok(Some(true))  — match: continue search up
+                    //                            (`lo = mid`).
+                    //   helper Ok(Some(false)) — diverge: continue search
+                    //                            down (`hi = mid - 1`), no
+                    //                            strike.
+                    //   helper Err(msg)        — `hdrs[0].height` wrong, the
+                    //                            real protocol violation;
+                    //                            map to
+                    //                            `DeliveredInvalidHeader`.
+                    let our_bid =
+                        node.storage.get_block_id_by_height(mid).ok().flatten();
+                    match interpret_ancestor_probe_response(&hdrs, mid, our_bid) {
+                        Ok(Some(true)) => lo = mid,
+                        Ok(Some(false)) => hi = mid.saturating_sub(1),
+                        Ok(None) => {
+                            return Err(TipValidationError::PeerNoForwardData(format!(
+                                "empty / no-data response to ancestor midpoint \
+                                 probe at height {}",
+                                mid
+                            )));
+                        }
+                        Err(msg) => {
+                            return Err(TipValidationError::DeliveredInvalidHeader(msg));
+                        }
                     }
                 }
                 lo
@@ -8053,6 +8086,232 @@ pub async fn run_tip_forward_validation(
 }
 
 // ── v1.6.0 Fix 1 redesign: unit tests for utility-based eviction ──
+#[cfg(test)]
+mod ancestor_probe_tests {
+    //! Pin the over-delivery tolerance fix for ancestor probes.
+    //!
+    //! Background: pre-v1.9.2 peers ignore `max_count` on `GetHeaders` and
+    //! reply with up to `MAX_GETBLOCKS_ITEMS = 64` headers in a single batch.
+    //! Our IBD and tip-validation ancestor probes ask for `max_count = 1`
+    //! and historically rejected any response with `len > 1` as a protocol
+    //! violation. That rejection caused the live wedge documented in the
+    //! commit body: each probe stroke the only `ever_confirmed_for_ibd=true`
+    //! peer, the peer dropped after 5 strikes, no other peer could become
+    //! eligible, sync froze for 16+ hours at h=605,656.
+    //!
+    //! Post-fix: only `hdrs[0]` is consumed; over-delivery is tolerated;
+    //! the only protocol-violation case left is `hdrs[0].height` not
+    //! matching the requested height (the one header we use is unusable).
+
+    use super::*;
+
+    fn header_at(height: u64, nonce: u64) -> BlockHeader {
+        let mut target = [0xFFu8; 32];
+        target[31] = 0x10;
+        BlockHeader {
+            version: 1,
+            height,
+            prev_block_id: Hash256::ZERO,
+            timestamp: 1_000_000 + height * 10,
+            difficulty_target: Hash256(target),
+            nonce,
+            tx_root: Hash256::ZERO,
+            state_root: Hash256::ZERO,
+        }
+    }
+
+    #[test]
+    fn empty_response_returns_none_no_strike() {
+        // Peer rate-limited or has no data at this height. Caller skips
+        // the probe with no strike — Ok(None).
+        let res = interpret_ancestor_probe_response(&[], 605_656, None);
+        assert!(matches!(res, Ok(None)));
+    }
+
+    #[test]
+    fn single_matching_header_returns_some_true() {
+        let h = header_at(605_656, 7);
+        let block_id = h.block_id();
+        let res = interpret_ancestor_probe_response(&[h], 605_656, Some(block_id));
+        assert!(matches!(res, Ok(Some(true))));
+    }
+
+    #[test]
+    fn single_diverging_header_returns_some_false() {
+        // Peer's header at the requested height is different from ours
+        // (fork). Binary search continues / fork is detected.
+        let h_ours = header_at(605_656, 1);
+        let h_peer = header_at(605_656, 2);
+        assert_ne!(h_ours.block_id(), h_peer.block_id());
+        let res =
+            interpret_ancestor_probe_response(&[h_peer], 605_656, Some(h_ours.block_id()));
+        assert!(matches!(res, Ok(Some(false))));
+    }
+
+    #[test]
+    fn over_delivery_with_correct_first_header_is_tolerated() {
+        // THE REGRESSION TEST. Pre-fix: this returned
+        // `Err("ancestor probe at height 605656 returned 64 headers, expected 1")`
+        // which struck the peer and (after 5 strikes) caused the live
+        // 16-hour IBD wedge on fly.io. Post-fix: hdrs[0] is the only
+        // header consumed, extras are informational, response is
+        // accepted as a positive ancestor confirmation.
+        let h0 = header_at(605_656, 42);
+        let block_id = h0.block_id();
+        // Build a 64-header overflow batch — same shape as a pre-v1.9.2
+        // peer that ignored max_count and replied with one full
+        // MAX_GETBLOCKS_ITEMS batch.
+        let mut batch = vec![h0];
+        for i in 1..64 {
+            batch.push(header_at(605_656 + i, 42 + i));
+        }
+        assert_eq!(batch.len(), 64);
+        let res = interpret_ancestor_probe_response(&batch, 605_656, Some(block_id));
+        assert!(
+            matches!(res, Ok(Some(true))),
+            "over-deliver with correct hdrs[0] must be tolerated, got {:?}",
+            res
+        );
+    }
+
+    #[test]
+    fn over_delivery_with_diverging_first_header_returns_some_false() {
+        // Even with extras, divergent hdrs[0] is still a fork signal —
+        // it propagates up so the binary search continues.
+        let h_ours = header_at(605_656, 100);
+        let mut batch = vec![header_at(605_656, 200)];
+        for i in 1..32 {
+            batch.push(header_at(605_656 + i, 200 + i));
+        }
+        let res =
+            interpret_ancestor_probe_response(&batch, 605_656, Some(h_ours.block_id()));
+        assert!(matches!(res, Ok(Some(false))));
+    }
+
+    #[test]
+    fn wrong_height_in_hdrs0_is_protocol_violation() {
+        // hdrs[0].height ≠ requested height is the one real protocol-
+        // level violation that remains. Caller surfaces this as an
+        // error (which the IBD path treats as cooldown + retry).
+        let h_wrong = header_at(605_700, 1);
+        let res =
+            interpret_ancestor_probe_response(&[h_wrong], 605_656, Some(Hash256::ZERO));
+        match res {
+            Err(msg) => {
+                assert!(msg.contains("605700"));
+                assert!(msg.contains("605656"));
+                assert!(msg.contains("first one used"));
+            }
+            other => panic!("expected Err, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn we_lack_a_block_at_height_returns_some_with_none_storage() {
+        // If our storage has no block at the probed height, we can't
+        // compare equality. Today's call site maps this to Ok(None) —
+        // surfacing the "no comparison possible" state to the caller.
+        let h = header_at(605_656, 1);
+        let res = interpret_ancestor_probe_response(&[h], 605_656, None);
+        assert!(matches!(res, Ok(None)));
+    }
+
+    // ── Per-call-site shape tests ───────────────────────────────────────
+    //
+    // `interpret_ancestor_probe_response` is shared by three call sites in
+    // sync.rs (v1.11.1 — review of #11 identified that the midpoint probe
+    // had been inlining its own copy of the now-fixed strict reject):
+    //
+    //   1. `Node::check_shared_block_via_events`     — IBD ancestor probe
+    //      (sync.rs:4648)
+    //   2. `run_tip_forward_validation` initial probe — tip-validation
+    //      path 2a at the clamped probe height (sync.rs:7707)
+    //   3. `run_tip_forward_validation` midpoint loop — tip-validation
+    //      path 2a binary search per iteration (sync.rs:7775)
+    //
+    // The midpoint specifically maps the helper's outcomes to lo/hi
+    // updates on the binary search bounds. The tests below assert each
+    // helper-result variant maps the way the midpoint code path expects.
+    // A full integration-shape test (Node + mock peer driving the search
+    // loop end-to-end) is intentionally not added in this PR — there's
+    // no sync-loop test harness in tree, building one is non-trivial,
+    // and the helper-shared-by-all-three-sites refactor means a unit
+    // test against the helper is now a real coverage signal for every
+    // call site. Adding the harness is tracked as a follow-up.
+
+    #[test]
+    fn midpoint_match_advances_lo_via_helper() {
+        // Midpoint expects: helper Ok(Some(true)) → lo = mid
+        // (chain agrees up to this height, search continues UP).
+        let mid = 250_000;
+        let h = header_at(mid, 1);
+        let our_bid = Some(h.block_id());
+        let res = interpret_ancestor_probe_response(&[h], mid, our_bid);
+        assert!(
+            matches!(res, Ok(Some(true))),
+            "midpoint match-with-len-1 must return Ok(Some(true)) so the \
+             site can advance lo = mid; got {:?}",
+            res
+        );
+    }
+
+    #[test]
+    fn midpoint_diverge_retreats_hi_via_helper() {
+        // Midpoint expects: helper Ok(Some(false)) → hi = mid - 1
+        // (chains diverge at this height, search continues DOWN).
+        let mid = 250_000;
+        let h_ours = header_at(mid, 1);
+        let h_peer = header_at(mid, 2);
+        assert_ne!(h_ours.block_id(), h_peer.block_id());
+        let res = interpret_ancestor_probe_response(&[h_peer], mid, Some(h_ours.block_id()));
+        assert!(
+            matches!(res, Ok(Some(false))),
+            "midpoint diverge-with-len-1 must return Ok(Some(false)) so the \
+             site can retreat hi = mid - 1; got {:?}",
+            res
+        );
+    }
+
+    #[test]
+    fn midpoint_overdelivery_with_match_still_advances_lo() {
+        // The bug the v1.11.1 follow-up addresses: pre-fix, the midpoint
+        // inlined `headers.len() != 1` → DeliveredInvalidHeader (strike).
+        // Post-fix it delegates to this helper. The helper must report
+        // match (Ok(Some(true))) so the site can advance lo and the
+        // binary search converges, NOT a strike that disconnects the peer.
+        let mid = 250_000;
+        let h0 = header_at(mid, 42);
+        let our_bid = Some(h0.block_id());
+        let mut batch = vec![h0];
+        for i in 1..64 {
+            batch.push(header_at(mid + i, 100 + i));
+        }
+        let res = interpret_ancestor_probe_response(&batch, mid, our_bid);
+        assert!(
+            matches!(res, Ok(Some(true))),
+            "midpoint over-delivery with matching hdrs[0] must return \
+             Ok(Some(true)) — pre-fix this returned the strike-class \
+             Err({:?}) which is what wedged sync at h=605,656",
+            res
+        );
+    }
+
+    #[test]
+    fn midpoint_overdelivery_with_diverge_still_retreats_hi() {
+        // Same shape as above but the peer's hdrs[0] diverges. Must still
+        // return Ok(Some(false)) so the midpoint's hi retreats; the
+        // extras don't promote a fork to a protocol violation.
+        let mid = 250_000;
+        let h_ours = header_at(mid, 1);
+        let mut batch = vec![header_at(mid, 2)];
+        for i in 1..16 {
+            batch.push(header_at(mid + i, 100 + i));
+        }
+        let res = interpret_ancestor_probe_response(&batch, mid, Some(h_ours.block_id()));
+        assert!(matches!(res, Ok(Some(false))));
+    }
+}
+
 #[cfg(test)]
 mod eviction_tests {
     use super::*;
