@@ -119,6 +119,28 @@ pub fn open_chain(
             .map(|id| id == Hash256(ASSUME_VALID_HASH))
             .unwrap_or(false);
 
+    // Operator opt-in: when `EXFER_TRUST_MARKERS` is set in the
+    // environment, the structural-walk PoW check is unconditionally
+    // skipped (the post-walk state_root cross-check is the remaining
+    // safety net — it loads UTXOS_TABLE and verifies that its
+    // computed root matches the tip header's state_root, so any
+    // chain.redb tampering still surfaces as a hard error). Turns a
+    // multi-hour boot (real Argon2id on ~105 k blocks above
+    // ASSUME_VALID_HEIGHT) into a structural-only walk that
+    // completes in seconds. Intended for operator debug iterations
+    // where each redeploy was paying the full PoW walk despite the
+    // markers + UTXOS_TABLE already being trusted on disk; default
+    // off so the corruption-detection surface is unchanged for
+    // operators who don't explicitly opt in.
+    let trust_markers = std::env::var_os("EXFER_TRUST_MARKERS").is_some();
+    if trust_markers {
+        info!(
+            "EXFER_TRUST_MARKERS set — skipping PoW on open_chain structural walk; \
+             relying on the post-walk state_root cross-check + persisted snapshot \
+             markers for chain integrity."
+        );
+    }
+
     // -------- Cheap structural per-block walk --------
     let mut prev_id = Hash256::ZERO;
     let mut cumulative_work = [0u8; 32];
@@ -169,7 +191,7 @@ pub fn open_chain(
             let target =
                 expected_difficulty(storage, &block.header.prev_block_id, block.header.height)
                     .map_err(|e| format!("difficulty computation failed at height {}: {}", height, e))?;
-            let skip_pow = assume_valid_proven && height <= ASSUME_VALID_HEIGHT;
+            let skip_pow = trust_markers || (assume_valid_proven && height <= ASSUME_VALID_HEIGHT);
             let result = if skip_pow {
                 validate_block_header_skip_pow(
                     &block,
