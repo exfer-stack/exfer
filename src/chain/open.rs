@@ -142,6 +142,7 @@ pub fn open_chain(
     }
 
     // -------- Cheap structural per-block walk --------
+    let walk_start = std::time::Instant::now();
     let mut prev_id = Hash256::ZERO;
     let mut cumulative_work = [0u8; 32];
     for height in 0..=tip_height {
@@ -225,16 +226,34 @@ pub fn open_chain(
         ));
     }
 
+    info!(
+        "BENCH open_chain: structural walk {} blocks in {:.3}s",
+        tip_height + 1,
+        walk_start.elapsed().as_secs_f64()
+    );
+
     // -------- Load persisted UTXO snapshot + state_root cross-check --------
+    let iter_start = std::time::Instant::now();
     let utxos = storage
         .iter_utxos()
         .map_err(|e| format!("failed to read UTXOS_TABLE: {}", e))?;
     let utxo_count = utxos.len();
+    info!(
+        "BENCH open_chain: iter_utxos read {} entries in {:.3}s",
+        utxo_count,
+        iter_start.elapsed().as_secs_f64()
+    );
+    let rebuild_start = std::time::Instant::now();
     for (op, entry) in utxos {
         utxo_set
             .insert(op, entry)
             .map_err(|e| format!("failed to seed in-memory UtxoSet from snapshot: {:?}", e))?;
     }
+    info!(
+        "BENCH open_chain: SMT rebuild ({} inserts) in {:.3}s",
+        utxo_count,
+        rebuild_start.elapsed().as_secs_f64()
+    );
     let computed_root = utxo_set.state_root();
     if computed_root != tip_header.state_root {
         return Err(format!(
