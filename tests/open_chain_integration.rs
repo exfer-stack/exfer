@@ -40,7 +40,7 @@ fn open_chain_fast_path_succeeds_on_populated_snapshot() {
     let storage = fresh_storage(&dir, "test.redb");
     let genesis_id = genesis_block().header.block_id();
     let mut utxos = UtxoSet::new();
-    let tip1 = open_chain(&storage, &mut utxos, &genesis_id, false, false)
+    let tip1 = open_chain(&storage, &mut utxos, &genesis_id, false, false, true)
         .expect("first open should bootstrap genesis");
     assert_eq!(tip1.block_id, genesis_id, "tip is genesis");
     let root1 = utxos.state_root();
@@ -62,7 +62,7 @@ fn open_chain_fast_path_succeeds_on_populated_snapshot() {
     drop(storage);
     let storage2 = fresh_storage(&dir, "test.redb");
     let mut utxos2 = UtxoSet::new();
-    let tip2 = open_chain(&storage2, &mut utxos2, &genesis_id, false, false)
+    let tip2 = open_chain(&storage2, &mut utxos2, &genesis_id, false, false, true)
         .expect("second open should take fast path");
     assert_eq!(tip2.block_id, tip1.block_id, "tip stable");
     assert_eq!(tip2.height, tip1.height, "height stable");
@@ -84,7 +84,7 @@ fn open_chain_falls_back_to_replay_when_marker_absent() {
     let storage = fresh_storage(&dir, "test.redb");
     let genesis_id = genesis_block().header.block_id();
     let mut utxos = UtxoSet::new();
-    let tip1 = open_chain(&storage, &mut utxos, &genesis_id, false, false).unwrap();
+    let tip1 = open_chain(&storage, &mut utxos, &genesis_id, false, false, true).unwrap();
     let root1 = utxos.state_root();
 
     storage
@@ -102,7 +102,7 @@ fn open_chain_falls_back_to_replay_when_marker_absent() {
     drop(storage);
     let storage2 = fresh_storage(&dir, "test.redb");
     let mut utxos2 = UtxoSet::new();
-    let tip2 = open_chain(&storage2, &mut utxos2, &genesis_id, false, false)
+    let tip2 = open_chain(&storage2, &mut utxos2, &genesis_id, false, false, true)
         .expect("fallback to replay must succeed");
     assert_eq!(tip2.block_id, tip1.block_id);
     assert_eq!(utxos2.state_root(), root1, "replay-derived state_root matches");
@@ -123,7 +123,7 @@ fn open_chain_auto_migrate_backfills_snapshot_on_fallback() {
     let storage = fresh_storage(&dir, "test.redb");
     let genesis_id = genesis_block().header.block_id();
     let mut utxos = UtxoSet::new();
-    let _tip = open_chain(&storage, &mut utxos, &genesis_id, false, true)
+    let _tip = open_chain(&storage, &mut utxos, &genesis_id, false, true, true)
         .expect("first open bootstraps genesis");
 
     // Pretend this is a pre-Phase-3a datadir by clearing the snapshot
@@ -142,7 +142,7 @@ fn open_chain_auto_migrate_backfills_snapshot_on_fallback() {
     drop(storage);
     let storage2 = fresh_storage(&dir, "test.redb");
     let mut utxos2 = UtxoSet::new();
-    let _ = open_chain(&storage2, &mut utxos2, &genesis_id, false, true)
+    let _ = open_chain(&storage2, &mut utxos2, &genesis_id, false, true, true)
         .expect("second open with auto_migrate fallback");
     assert_eq!(
         storage2.get_utxo_snapshot_tip().unwrap(),
@@ -154,7 +154,7 @@ fn open_chain_auto_migrate_backfills_snapshot_on_fallback() {
     drop(storage2);
     let storage3 = fresh_storage(&dir, "test.redb");
     let mut utxos3 = UtxoSet::new();
-    let _ = open_chain(&storage3, &mut utxos3, &genesis_id, false, true)
+    let _ = open_chain(&storage3, &mut utxos3, &genesis_id, false, true, true)
         .expect("third open is fast path");
     // Sanity: the in-memory UtxoSet must agree with the genesis state_root.
     let expected_root = {
@@ -183,7 +183,7 @@ fn no_auto_migrate_replays_on_every_restart() {
     let storage = fresh_storage(&dir, "test.redb");
     let genesis_id = genesis_block().header.block_id();
     let mut utxos = UtxoSet::new();
-    let _ = open_chain(&storage, &mut utxos, &genesis_id, false, true).unwrap();
+    let _ = open_chain(&storage, &mut utxos, &genesis_id, false, true, true).unwrap();
     let canonical_root = utxos.state_root();
 
     // Pretend this is a pre-Phase-3a datadir.
@@ -197,7 +197,7 @@ fn no_auto_migrate_replays_on_every_restart() {
     for restart in 1..=3 {
         let s = fresh_storage(&dir, "test.redb");
         let mut u = UtxoSet::new();
-        let tip = open_chain(&s, &mut u, &genesis_id, false, false)
+        let tip = open_chain(&s, &mut u, &genesis_id, false, false, true)
             .unwrap_or_else(|e| panic!("restart {restart}: open_chain must not error: {e}"));
         assert_eq!(tip.block_id, genesis_id, "restart {restart}: tip stable");
         assert_eq!(
@@ -225,7 +225,7 @@ fn rebuild_state_recovery_loop_clears_and_finalizes_in_one_boot() {
     let storage = fresh_storage(&dir, "test.redb");
     let genesis_id = genesis_block().header.block_id();
     let mut utxos = UtxoSet::new();
-    let _ = open_chain(&storage, &mut utxos, &genesis_id, false, true).unwrap();
+    let _ = open_chain(&storage, &mut utxos, &genesis_id, false, true, true).unwrap();
     let expected_root = utxos.state_root();
 
     // Operator's recovery step: clear the snapshot in place.
@@ -239,7 +239,7 @@ fn rebuild_state_recovery_loop_clears_and_finalizes_in_one_boot() {
     drop(storage);
     let storage2 = fresh_storage(&dir, "test.redb");
     let mut utxos2 = UtxoSet::new();
-    let _ = open_chain(&storage2, &mut utxos2, &genesis_id, false, true)
+    let _ = open_chain(&storage2, &mut utxos2, &genesis_id, false, true, true)
         .expect("rebuild recovery via fallback+finalize");
     assert_eq!(
         storage2.get_utxo_snapshot_tip().unwrap(),
@@ -260,7 +260,7 @@ fn open_chain_rejects_when_marker_matches_but_state_root_mismatches() {
     let storage = fresh_storage(&dir, "test.redb");
     let genesis_id = genesis_block().header.block_id();
     let mut utxos = UtxoSet::new();
-    let tip = open_chain(&storage, &mut utxos, &genesis_id, false, false).unwrap();
+    let tip = open_chain(&storage, &mut utxos, &genesis_id, false, false, true).unwrap();
     assert_eq!(tip.block_id, genesis_id);
 
     // 2. Inject an extra (non-canonical) UTXO into the in-memory set BEFORE
@@ -285,7 +285,7 @@ fn open_chain_rejects_when_marker_matches_but_state_root_mismatches() {
     drop(storage);
     let storage2 = fresh_storage(&dir, "test.redb");
     let mut utxos2 = UtxoSet::new();
-    let err = open_chain(&storage2, &mut utxos2, &genesis_id, false, false)
+    let err = open_chain(&storage2, &mut utxos2, &genesis_id, false, false, true)
         .expect_err("must fail on state_root mismatch");
     assert!(
         err.contains("state_root"),
@@ -296,5 +296,64 @@ fn open_chain_rejects_when_marker_matches_but_state_root_mismatches() {
         err.contains("--rebuild-state"),
         "error message must point at --rebuild-state recovery: {}",
         err
+    );
+}
+
+#[test]
+fn open_chain_walk_checkpoint_skip_and_full_verify_parity() {
+    // Track 1 (issue #6): once the walk marker equals the tip, open_chain
+    // skips the structural walk and reads cumulative work O(1) from
+    // WORK_TABLE. --full-verify (trust_walk_marker=false) forces the full
+    // walk but must derive the identical result and re-stamp the marker so
+    // the next boot is fast again.
+    let dir = TempDir::new().unwrap();
+    let storage = fresh_storage(&dir, "test.redb");
+    let genesis_id = genesis_block().header.block_id();
+
+    // First boot: empty DB → genesis bootstrap. commit_genesis_atomic stamps
+    // the walk marker as a side effect.
+    let mut utxos = UtxoSet::new();
+    let tip1 = open_chain(&storage, &mut utxos, &genesis_id, false, true, true)
+        .expect("genesis bootstrap");
+    assert_eq!(
+        storage.get_walk_verified_tip().unwrap(),
+        Some(tip1.block_id),
+        "genesis boot stamps the walk-verified marker"
+    );
+
+    // Second boot, trust_walk_marker=true → fast skip path. Cumulative work
+    // must match the bootstrap value (read from WORK_TABLE, not re-walked).
+    drop(storage);
+    let storage2 = fresh_storage(&dir, "test.redb");
+    let mut u2 = UtxoSet::new();
+    let tip2 = open_chain(&storage2, &mut u2, &genesis_id, false, true, true)
+        .expect("fast skip path");
+    assert_eq!(tip2.block_id, tip1.block_id, "tip stable on skip path");
+    assert_eq!(
+        tip2.cumulative_work, tip1.cumulative_work,
+        "skip path reads cumulative work from WORK_TABLE — parity with the walk"
+    );
+    assert_eq!(
+        storage2.get_walk_verified_tip().unwrap(),
+        Some(tip1.block_id),
+        "skip path leaves the marker current"
+    );
+
+    // Third boot, trust_walk_marker=false (--full-verify) → forces the full
+    // walk, derives the same result, and re-stamps the marker.
+    drop(storage2);
+    let storage3 = fresh_storage(&dir, "test.redb");
+    let mut u3 = UtxoSet::new();
+    let tip3 = open_chain(&storage3, &mut u3, &genesis_id, false, true, false)
+        .expect("--full-verify forced walk");
+    assert_eq!(tip3.block_id, tip1.block_id);
+    assert_eq!(
+        tip3.cumulative_work, tip1.cumulative_work,
+        "--full-verify walk derives the same cumulative work as the skip path"
+    );
+    assert_eq!(
+        storage3.get_walk_verified_tip().unwrap(),
+        Some(tip1.block_id),
+        "--full-verify re-stamps the marker so the next boot is fast again"
     );
 }
