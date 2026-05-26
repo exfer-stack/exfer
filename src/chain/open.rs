@@ -48,12 +48,19 @@ use crate::types::{ASSUME_VALID_HASH, ASSUME_VALID_HEIGHT, MTP_WINDOW};
 /// UTXO snapshot):
 ///   - Per-tx signature / script validation
 ///   - UTXO state mutation during the walk
+/// Track 1 (issue #6) — `trust_walk_marker` controls the structural walk:
+/// when `true` (default), a `WALK_VERIFIED_TIP` marker equal to the current
+/// tip lets the walk be skipped entirely (cumulative work read O(1) from
+/// `WORK_TABLE`); a stale marker shrinks it to the unverified suffix. When
+/// `false` (`--full-verify`), the marker is ignored and the full genesis→tip
+/// walk runs, then the marker is re-stamped so subsequent boots are fast again.
 pub fn open_chain(
     storage: &Arc<ChainStorage>,
     utxo_set: &mut UtxoSet,
     expected_genesis_id: &Hash256,
     assume_valid: bool,
     auto_migrate: bool,
+    trust_walk_marker: bool,
 ) -> Result<ChainTip, String> {
     // Bootstrap-from-empty / tip-missing remains entirely handled by
     // replay_chain (genesis seeding lives in the caller path before us
@@ -119,10 +126,101 @@ pub fn open_chain(
             .map(|id| id == Hash256(ASSUME_VALID_HASH))
             .unwrap_or(false);
 
-    // -------- Cheap structural per-block walk --------
+    // -------- Track 1: decide how much structural walk is needed --------
+    //
+    // TRUST-MODEL NOTE: skipping the walk relaxes corruption detection. The
+    // walk re-checks header linkage, full-block structure (body present,
+    // tx_root, intra-block double-spend, coinbase shape) and re-derives
+    // cumulative work over already-canonical, already-validated blocks. With
+    // the marker present, those checks are elided on boot, so corruption in
+    // *old* canonical blocks becomes a latent runtime failure (surfaced when
+    // that block is next read — e.g. a reorg back through it) instead of a
+    // boot-time abort. This is acceptable for routine operation (old canonical
+    // blocks are immutable and were validated when first received); the marker
+    // is advanced atomically with the tip by every commit, and `--full-verify`
+    // forces a one-shot full walk for operators who want defense-in-depth. The
+    // persisted-UTXO `state_root` cross-check below is unaffected either way.
+    let walk_marker = if trust_walk_marker {
+        storage
+            .get_walk_verified_tip()
+            .map_err(|e| format!("db error reading walk-verified marker: {}", e))?
+    } else {
+        None // --full-verify: ignore the marker, force a full walk, re-stamp at end.
+    };
+
     let mut prev_id = Hash256::ZERO;
     let mut cumulative_work = [0u8; 32];
-    for height in 0..=tip_height {
+    // Half-open lower bound of the walk: 0 = full walk, tip_height+1 = skip.
+    let mut walk_from: u64 = 0;
+
+    match walk_marker {
+        Some(id) if id == tip_id => {
+            // Fast path: the walk was already proven through the current tip.
+            // Read cumulative work directly from WORK_TABLE (O(1)); fall back
+            // to a full walk if it is somehow absent (defensive — every commit
+            // persists it).
+            match storage
+                .get_cumulative_work(&tip_id)
+                .map_err(|e| format!("db error reading cumulative work for tip: {}", e))?
+            {
+                Some(work) => {
+                    cumulative_work = work;
+                    prev_id = tip_id;
+                    walk_from = tip_height + 1; // empty walk range
+                    info!(
+                        "Boot: walk checkpoint current (tip={} height={}); skipping structural walk",
+                        tip_id, tip_height
+                    );
+                }
+                None => {
+                    info!(
+                        "Boot: walk marker present but cumulative work missing for tip {}; \
+                         running full structural walk",
+                        tip_id
+                    );
+                }
+            }
+        }
+        Some(ancestor) => {
+            // Stale marker: walk only the suffix [marker_height+1 ..= tip].
+            let marker_header = storage
+                .get_header(&ancestor)
+                .map_err(|e| format!("db error reading walk-marker header: {}", e))?;
+            let marker_work = storage
+                .get_cumulative_work(&ancestor)
+                .map_err(|e| format!("db error reading walk-marker cumulative work: {}", e))?;
+            match (marker_header, marker_work) {
+                (Some(h), Some(work)) if h.height <= tip_height => {
+                    prev_id = ancestor;
+                    cumulative_work = work;
+                    walk_from = h.height + 1;
+                    info!(
+                        "Boot: walk checkpoint stale (marker={} height={} current_tip={} height={}); \
+                         walking suffix {}..={}",
+                        ancestor, h.height, tip_id, tip_height, walk_from, tip_height
+                    );
+                }
+                _ => {
+                    info!(
+                        "Boot: walk marker {} unusable (header/work missing or beyond tip); \
+                         running full structural walk",
+                        ancestor
+                    );
+                }
+            }
+        }
+        None => {
+            if trust_walk_marker {
+                info!("Boot: no walk checkpoint; running full structural walk (will stamp marker)");
+            } else {
+                info!("Boot: --full-verify — running full structural walk regardless of marker");
+            }
+        }
+    }
+    let did_walk = walk_from <= tip_height;
+
+    // -------- Cheap structural per-block walk (over [walk_from ..= tip]) --------
+    for height in walk_from..=tip_height {
         let block_id = storage
             .get_block_id_by_height(height)
             .map_err(|e| format!("db error at height {}: {}", height, e))?
@@ -221,6 +319,16 @@ pub fn open_chain(
              a full chain replay.",
             computed_root, tip_header.state_root
         ));
+    }
+
+    // Track 1: if we actually walked (full / partial / forced --full-verify),
+    // the structural integrity of the chain through the tip is now proven and
+    // the state_root cross-check passed — stamp the marker so the next boot
+    // takes the fast path. The skip path left the marker already current.
+    if did_walk {
+        storage
+            .set_walk_verified_tip(&tip_id)
+            .map_err(|e| format!("failed to persist walk-verified marker: {}", e))?;
     }
 
     info!(
