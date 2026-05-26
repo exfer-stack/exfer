@@ -455,32 +455,128 @@ async fn handle_get_balance(
 /// Also the default page size when the caller omits `limit`.
 const UTXO_PAGE_LIMIT: usize = 1000;
 
-/// Encode a UTXO-set cursor as `"<tx_id_hex>:<output_index>"`. Returned as
-/// `next_cursor` and passed back as `cursor` to fetch the next page.
-fn encode_utxo_cursor(op: &OutPoint) -> String {
-    format!("{}:{}", hex::encode(op.tx_id.as_bytes()), op.output_index)
+/// Encode a tip-anchored UTXO-set cursor as `"<tip_id_hex>:<tx_id_hex>:<output_index>"`.
+/// The tip id pins the page sequence to one chainstate snapshot — see
+/// `paged_utxos_for_script` for why. Returned as `next_cursor`, passed back as
+/// `cursor` to fetch the next page.
+fn encode_utxo_cursor(tip_id: &Hash256, op: &OutPoint) -> String {
+    format!(
+        "{}:{}:{}",
+        hex::encode(tip_id.as_bytes()),
+        hex::encode(op.tx_id.as_bytes()),
+        op.output_index
+    )
 }
 
-/// Parse a `"<tx_id_hex>:<output_index>"` cursor into an `OutPoint`.
-fn parse_utxo_cursor(s: &str) -> Result<OutPoint, String> {
-    let (tx_hex, idx_str) = s
-        .split_once(':')
-        .ok_or_else(|| "cursor must be '<tx_id_hex>:<output_index>'".to_string())?;
-    let bytes = hex::decode(tx_hex).map_err(|e| format!("invalid cursor tx_id hex: {}", e))?;
-    if bytes.len() != 32 {
-        return Err(format!("cursor tx_id must be 32 bytes, got {}", bytes.len()));
-    }
-    let mut h = [0u8; 32];
-    h.copy_from_slice(&bytes);
+/// Parse a `"<tip_id_hex>:<tx_id_hex>:<output_index>"` cursor into
+/// `(tip_id, after_outpoint)`.
+fn parse_utxo_cursor(s: &str) -> Result<(Hash256, OutPoint), String> {
+    let mut parts = s.splitn(3, ':');
+    let tip_hex = parts.next();
+    let tx_hex = parts.next();
+    let idx_str = parts.next();
+    let (tip_hex, tx_hex, idx_str) = match (tip_hex, tx_hex, idx_str) {
+        (Some(a), Some(b), Some(c)) => (a, b, c),
+        _ => return Err("cursor must be '<tip_id_hex>:<tx_id_hex>:<output_index>'".to_string()),
+    };
+    let parse_hash = |label: &str, hexs: &str| -> Result<Hash256, String> {
+        let bytes = hex::decode(hexs).map_err(|e| format!("invalid cursor {} hex: {}", label, e))?;
+        if bytes.len() != 32 {
+            return Err(format!("cursor {} must be 32 bytes, got {}", label, bytes.len()));
+        }
+        let mut h = [0u8; 32];
+        h.copy_from_slice(&bytes);
+        Ok(Hash256(h))
+    };
+    let tip_id = parse_hash("tip_id", tip_hex)?;
+    let tx_id = parse_hash("tx_id", tx_hex)?;
     let output_index: u32 = idx_str
         .parse()
         .map_err(|e| format!("invalid cursor output_index: {}", e))?;
-    Ok(OutPoint::new(Hash256(h), output_index))
+    Ok((tip_id, OutPoint::new(tx_id, output_index)))
 }
 
 /// Resolve the requested page size into the clamped `[1, UTXO_PAGE_LIMIT]` range.
 fn resolve_page_limit(requested: Option<usize>) -> usize {
     requested.unwrap_or(UTXO_PAGE_LIMIT).clamp(1, UTXO_PAGE_LIMIT)
+}
+
+/// One cursor-paginated page of UTXOs for a script, shared by
+/// `get_address_utxos` and `get_script_utxos`.
+struct UtxoPage {
+    matched: Vec<(OutPoint, u64, u64, bool)>,
+    next_cursor: Option<String>,
+    truncated: bool,
+    tip_height: u64,
+}
+
+/// Read one tip-anchored page of UTXOs for `script`.
+///
+/// The cursor embeds the tip block id at which the walk began. Because an
+/// `OutPoint` is a content hash, a UTXO arriving for this script mid-walk can
+/// sort anywhere in the `by_script` set — including *before* the saved cursor,
+/// where it would never be visited — and coinbase maturity is height-dependent,
+/// so the mature/immature split shifts as the tip advances. Pinning the walk to
+/// a single tip keeps "walk to completion" actually complete: if the tip has
+/// moved since the cursor was issued, we reject with a clear "snapshot expired"
+/// error and the caller restarts from `cursor = None` against the new tip. No
+/// server-side snapshot state; on a wallet-sized set the restart is sub-second.
+///
+/// Probes one beyond the page so an exact-multiple-of-page set does not emit a
+/// cursor that yields an empty follow-up: `truncated` means "there ARE more",
+/// matching the pre-pagination single-call semantics.
+async fn paged_utxos_for_script(
+    id: &serde_json::Value,
+    node: &Arc<Node>,
+    script: &[u8],
+    cursor: &Option<String>,
+    limit: Option<usize>,
+) -> Result<UtxoPage, RpcResponse> {
+    let page = resolve_page_limit(limit);
+    // Snapshot tip height + id together so the expiry check and the height used
+    // for maturity come from the same read.
+    let (tip_height, tip_id) = {
+        let tip = node.tip.read().await;
+        (tip.height, tip.block_id)
+    };
+
+    let after = match cursor {
+        Some(c) => {
+            let (cursor_tip, op) = parse_utxo_cursor(c).map_err(|e| {
+                RpcResponse::err(id.clone(), INVALID_PARAMS, format!("Invalid cursor: {}", e))
+            })?;
+            if cursor_tip != tip_id {
+                return Err(RpcResponse::err(
+                    id.clone(),
+                    INVALID_PARAMS,
+                    "pagination snapshot expired, restart from cursor=None".to_string(),
+                ));
+            }
+            Some(op)
+        }
+        None => None,
+    };
+
+    let current_height = tip_height.saturating_add(1);
+    // Probe page+1: the extra item (if any) proves a next page exists.
+    let mut matched = {
+        let utxo_set = node.utxo_set.read().await;
+        utxo_set.utxos_for_script_paged(script, current_height, after, page + 1)
+    };
+    let truncated = matched.len() > page;
+    matched.truncate(page);
+    let next_cursor = if truncated {
+        matched.last().map(|t| encode_utxo_cursor(&tip_id, &t.0))
+    } else {
+        None
+    };
+
+    Ok(UtxoPage {
+        matched,
+        next_cursor,
+        truncated,
+        tip_height,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -523,33 +619,15 @@ async fn handle_get_address_utxos(
         );
     }
 
-    let after = match &parsed.cursor {
-        Some(c) => match parse_utxo_cursor(c) {
-            Ok(op) => Some(op),
-            Err(e) => return RpcResponse::err(id, INVALID_PARAMS, format!("Invalid cursor: {}", e)),
-        },
-        None => None,
-    };
-    let page = resolve_page_limit(parsed.limit);
-
     // UTXO scan serialized by utxo_scan_sem (1 permit) in dispatch.
-    let tip_height = node.tip.read().await.height;
-    let current_height = tip_height.saturating_add(1);
-
-    let matched = {
-        let utxo_set = node.utxo_set.read().await;
-        utxo_set.utxos_for_script_paged(&addr_bytes, current_height, after, page)
-    };
-    // A full page means there may be more; hand back a cursor to continue.
-    // No more silent truncation — callers can walk an address to completion.
-    let next_cursor = if matched.len() == page {
-        matched.last().map(|t| encode_utxo_cursor(&t.0))
-    } else {
-        None
-    };
-    let truncated = next_cursor.is_some();
+    let paged =
+        match paged_utxos_for_script(&id, node, &addr_bytes, &parsed.cursor, parsed.limit).await {
+            Ok(p) => p,
+            Err(resp) => return resp,
+        };
     // Lock released — format JSON without holding any chainstate locks.
-    let utxos: Vec<serde_json::Value> = matched
+    let utxos: Vec<serde_json::Value> = paged
+        .matched
         .iter()
         .map(|(outpoint, val, h, cb)| {
             serde_json::json!({
@@ -567,9 +645,9 @@ async fn handle_get_address_utxos(
         serde_json::json!({
             "address": parsed.address,
             "utxos": utxos,
-            "truncated": truncated,
-            "next_cursor": next_cursor,
-            "tip_height": tip_height,
+            "truncated": paged.truncated,
+            "next_cursor": paged.next_cursor,
+            "tip_height": paged.tip_height,
         }),
     )
 }
@@ -622,33 +700,16 @@ async fn handle_get_script_utxos(
         );
     }
 
-    let after = match &parsed.cursor {
-        Some(c) => match parse_utxo_cursor(c) {
-            Ok(op) => Some(op),
-            Err(e) => return RpcResponse::err(id, INVALID_PARAMS, format!("Invalid cursor: {}", e)),
-        },
-        None => None,
-    };
-    let page = resolve_page_limit(parsed.limit);
-
     // UTXO scan serialized by utxo_scan_sem (1 permit) in dispatch.
-    let tip_height = node.tip.read().await.height;
-    let current_height = tip_height.saturating_add(1);
-
-    let matched = {
-        let utxo_set = node.utxo_set.read().await;
-        utxo_set.utxos_for_script_paged(&script_bytes, current_height, after, page)
-    };
-    // A full page means there may be more; hand back a cursor to continue.
-    let next_cursor = if matched.len() == page {
-        matched.last().map(|t| encode_utxo_cursor(&t.0))
-    } else {
-        None
-    };
-    let truncated = next_cursor.is_some();
+    let paged =
+        match paged_utxos_for_script(&id, node, &script_bytes, &parsed.cursor, parsed.limit).await {
+            Ok(p) => p,
+            Err(resp) => return resp,
+        };
     // Lock released — format JSON without holding any chainstate locks.
     let script_len = script_bytes.len();
-    let utxos: Vec<serde_json::Value> = matched
+    let utxos: Vec<serde_json::Value> = paged
+        .matched
         .iter()
         .map(|(outpoint, val, h, cb)| {
             serde_json::json!({
@@ -667,9 +728,9 @@ async fn handle_get_script_utxos(
         serde_json::json!({
             "script_hex": parsed.script_hex,
             "utxos": utxos,
-            "truncated": truncated,
-            "next_cursor": next_cursor,
-            "tip_height": tip_height,
+            "truncated": paged.truncated,
+            "next_cursor": paged.next_cursor,
+            "tip_height": paged.tip_height,
         }),
     )
 }
@@ -1472,6 +1533,31 @@ pub fn rpc_call(
 mod rpc_client_tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn utxo_cursor_round_trips_with_tip_id() {
+        let tip = Hash256([7u8; 32]);
+        let op = OutPoint::new(Hash256([9u8; 32]), 3);
+        let encoded = encode_utxo_cursor(&tip, &op);
+        let (got_tip, got_op) = parse_utxo_cursor(&encoded).expect("round-trip");
+        assert_eq!(got_tip, tip);
+        assert_eq!(got_op, op);
+    }
+
+    #[test]
+    fn utxo_cursor_rejects_legacy_two_part_and_malformed() {
+        // Pre-fix cursors were "<tx_hex>:<idx>" (no tip) — must be rejected so a
+        // stale client restarts cleanly rather than silently mis-paginating.
+        let two_part = format!("{}:0", hex::encode([9u8; 32]));
+        assert!(parse_utxo_cursor(&two_part).is_err());
+        assert!(parse_utxo_cursor("garbage").is_err());
+        // Right shape, bad tip length.
+        let bad_tip = format!("ab:{}:0", hex::encode([9u8; 32]));
+        assert!(parse_utxo_cursor(&bad_tip).is_err());
+        // Right shape, non-numeric index.
+        let bad_idx = format!("{}:{}:notnum", hex::encode([7u8; 32]), hex::encode([9u8; 32]));
+        assert!(parse_utxo_cursor(&bad_idx).is_err());
+    }
 
     fn http_response(headers: &[(&str, &str)], body: &[u8]) -> Vec<u8> {
         let mut out = Vec::from(&b"HTTP/1.1 200 OK\r\n"[..]);
