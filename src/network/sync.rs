@@ -6876,13 +6876,28 @@ pub async fn run_sync_manager(node: Arc<Node>, mut rx: mpsc::Receiver<PeerEvent>
         // wedge AND the unconfirmed-claim wedge where no peer has been
         // promoted to confirmed yet. A peer spamming a bogus high claim is
         // itself useful signal — the breakdown rows show which peer it is.
+        //
+        // The "ahead" predicate MUST be `is_better_chain`, the same call the
+        // selector above uses to compute `should_ibd` — not a naive
+        // `cumulative_work >` comparison. Fork choice treats equal work +
+        // greater height as ahead (height tiebreaker), so a peer that is a
+        // genuine IBD candidate to the selector but blocked by another clause
+        // (unconfirmed, in cooldown) would be invisible to a naive gate,
+        // leaving the diagnostic silent on exactly the wedge it exists to
+        // surface. Construct the peer `ChainTip` inline the same way the
+        // selector does so gate and selector can never disagree.
         let peer_claims_ahead = should_ibd.is_none()
             && connected_count > 0
             && {
-                let our_work = node.tip.read().await.cumulative_work;
-                best_known_tip
-                    .as_ref()
-                    .is_some_and(|t| t.cumulative_work > our_work)
+                let our_tip = node.tip.read().await.clone();
+                best_known_tip.as_ref().is_some_and(|t| {
+                    let peer_ct = ChainTip {
+                        block_id: t.block_id,
+                        height: t.height,
+                        cumulative_work: t.cumulative_work,
+                    };
+                    is_better_chain(&peer_ct, &our_tip)
+                })
             };
         if peer_claims_ahead {
             let now_inst = Instant::now();
@@ -6902,12 +6917,25 @@ pub async fn run_sync_manager(node: Arc<Node>, mut rx: mpsc::Receiver<PeerEvent>
                         }
                         let tip_str = match &lp.tip {
                             None => "tip=none".to_string(),
-                            Some(t) => format!(
-                                "tip_h={} conf={} cw_gt={}",
-                                t.height,
-                                t.confirmed,
-                                t.cumulative_work > our_tip.cumulative_work
-                            ),
+                            // `ahead` uses is_better_chain (the selector's
+                            // predicate), not raw cumulative_work — so an
+                            // equal-work-higher-height peer reads ahead=true
+                            // here exactly as the selector would treat it,
+                            // and operators triage on the same notion of
+                            // "ahead" the candidacy logic uses.
+                            Some(t) => {
+                                let peer_ct = ChainTip {
+                                    block_id: t.block_id,
+                                    height: t.height,
+                                    cumulative_work: t.cumulative_work,
+                                };
+                                format!(
+                                    "tip_h={} conf={} ahead={}",
+                                    t.height,
+                                    t.confirmed,
+                                    is_better_chain(&peer_ct, &our_tip)
+                                )
+                            }
                         };
                         let cd = match lp.ibd_cooldown_until {
                             None => "ok".to_string(),
