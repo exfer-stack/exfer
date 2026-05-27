@@ -6566,6 +6566,13 @@ pub async fn run_sync_manager(node: Arc<Node>, mut rx: mpsc::Receiver<PeerEvent>
     let mut last_tip_poll = Instant::now();
     let mut ever_had_peer = false;
     let start_time = Instant::now();
+    // Throttle for the "no IBD candidate but peers connected" diagnostic
+    // log. We only emit one breakdown every NO_IBD_DIAG_PERIOD seconds so
+    // a sustained wedge doesn't drown the log stream, but the operator
+    // still gets a periodic snapshot of WHY no peer is currently eligible
+    // for IBD selection.
+    let mut last_no_ibd_diag: Option<Instant> = None;
+    const NO_IBD_DIAG_PERIOD_SECS: u64 = 300;
 
     node.sync_state
         .store(SyncState::CatchingUp as u8, Ordering::Relaxed);
@@ -6778,7 +6785,7 @@ pub async fn run_sync_manager(node: Arc<Node>, mut rx: mpsc::Receiver<PeerEvent>
         }
 
         // Derive all state from registry.by_identity
-        let (_best_known_tip, best_confirmed_work, connected_count, should_ibd) = {
+        let (best_known_tip, best_confirmed_work, connected_count, should_ibd) = {
             let peers = node.peers.lock().await;
             let our_tip = node.tip.read().await.clone();
             let now = std::time::Instant::now();
@@ -6856,6 +6863,118 @@ pub async fn run_sync_manager(node: Arc<Node>, mut rx: mpsc::Receiver<PeerEvent>
                 best_ibd.map(|(id, sid, _)| (id, sid)),
             )
         };
+
+        // Diagnostic: if we have connected peers but no IBD candidate, dump
+        // per-peer eligibility every NO_IBD_DIAG_PERIOD_SECS so the wedge
+        // is observable. Without this, a stuck supervisor looks identical
+        // to "node working fine, just no peer ahead" — and the wedges we
+        // hit on fly.io were invisible until we read source code paths.
+        //
+        // The third clause (`peer_claims_ahead`) is load-bearing, NOT
+        // redundant: `should_ibd == None` is also the NORMAL state of a
+        // healthy node sitting at the network tip — `is_better_chain`
+        // returns false for every peer because we ARE the tip. Without the
+        // clause, an at-tip node with N connected same-height peers would
+        // log the breakdown every NO_IBD_DIAG_PERIOD_SECS forever, turning
+        // a wedge-only diagnostic into perpetual steady-state noise. We gate
+        // on `best_known_tip` (the highest tip ANY connected peer claims,
+        // confirmed or not) rather than `best_confirmed_work` so the
+        // diagnostic fires for both wedge subtypes: the confirmed-peer-ahead
+        // wedge AND the unconfirmed-claim wedge where no peer has been
+        // promoted to confirmed yet. A peer spamming a bogus high claim is
+        // itself useful signal — the breakdown rows show which peer it is.
+        //
+        // The "ahead" predicate MUST be `is_better_chain`, the same call the
+        // selector above uses to compute `should_ibd` — not a naive
+        // `cumulative_work >` comparison. Fork choice treats equal work +
+        // greater height as ahead (height tiebreaker), so a peer that is a
+        // genuine IBD candidate to the selector but blocked by another clause
+        // (unconfirmed, in cooldown) would be invisible to a naive gate,
+        // leaving the diagnostic silent on exactly the wedge it exists to
+        // surface. Construct the peer `ChainTip` inline the same way the
+        // selector does so gate and selector can never disagree.
+        let peer_claims_ahead = should_ibd.is_none()
+            && connected_count > 0
+            && {
+                let our_tip = node.tip.read().await.clone();
+                best_known_tip.as_ref().is_some_and(|t| {
+                    let peer_ct = ChainTip {
+                        block_id: t.block_id,
+                        height: t.height,
+                        cumulative_work: t.cumulative_work,
+                    };
+                    is_better_chain(&peer_ct, &our_tip)
+                })
+            };
+        if peer_claims_ahead {
+            let now_inst = Instant::now();
+            let emit = match last_no_ibd_diag {
+                Some(t) => now_inst.duration_since(t).as_secs() >= NO_IBD_DIAG_PERIOD_SECS,
+                None => true,
+            };
+            if emit {
+                let breakdown = {
+                    let peers = node.peers.lock().await;
+                    let our_tip = node.tip.read().await.clone();
+                    let now = std::time::Instant::now();
+                    let mut rows: Vec<String> = Vec::new();
+                    for (id, lp) in &peers.by_identity {
+                        if lp.session.is_none() {
+                            continue;
+                        }
+                        let tip_str = match &lp.tip {
+                            None => "tip=none".to_string(),
+                            // `ahead` uses is_better_chain (the selector's
+                            // predicate), not raw cumulative_work — so an
+                            // equal-work-higher-height peer reads ahead=true
+                            // here exactly as the selector would treat it,
+                            // and operators triage on the same notion of
+                            // "ahead" the candidacy logic uses.
+                            Some(t) => {
+                                let peer_ct = ChainTip {
+                                    block_id: t.block_id,
+                                    height: t.height,
+                                    cumulative_work: t.cumulative_work,
+                                };
+                                format!(
+                                    "tip_h={} conf={} ahead={}",
+                                    t.height,
+                                    t.confirmed,
+                                    is_better_chain(&peer_ct, &our_tip)
+                                )
+                            }
+                        };
+                        let cd = match lp.ibd_cooldown_until {
+                            None => "ok".to_string(),
+                            Some(until) if now >= until => "ok".to_string(),
+                            Some(until) => {
+                                format!("{}s", until.duration_since(now).as_secs())
+                            }
+                        };
+                        rows.push(format!(
+                            "{:?} ever_ibd={} cooldown={} {}",
+                            &id[..4],
+                            lp.ever_confirmed_for_ibd,
+                            cd,
+                            tip_str
+                        ));
+                    }
+                    rows
+                };
+                info!(
+                    "Sync manager: no IBD candidate among {} connected peer(s) — eligibility breakdown:",
+                    connected_count
+                );
+                for row in breakdown {
+                    info!("  {}", row);
+                }
+                last_no_ibd_diag = Some(now_inst);
+            }
+        } else {
+            // Reset throttle so the next stuck period emits immediately
+            // instead of waiting out the full window.
+            last_no_ibd_diag = None;
+        }
 
         if let Some((peer_identity, peer_session_id)) = should_ibd {
             // v1.6.0 Fix 1: install IBD protection atomically with the
