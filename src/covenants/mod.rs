@@ -27,7 +27,4 @@ pub use builder::ScriptBuilder;
 #[cfg(feature = "channels")]
 pub use channel::{ChannelState, PaymentChannel};
 #[allow(unused_imports)]
-pub use htlc::{
-    try_parse_htlc, HtlcClaimRecord, HtlcParams, HtlcReclaimRecord, HtlcRecord, HtlcRole,
-    HtlcState,
-};
+pub use htlc::{try_parse_htlc, HtlcParams};
