@@ -6628,6 +6628,51 @@ fn next_strict_absent_since(
     }
 }
 
+/// Whether a peer observation counts as "a usable peer is confirmed this
+/// scan" for the wedge-fallback re-arm timer (`next_strict_absent_since`) and
+/// the relaxed-bucket suppression (`select_ibd_candidate`'s
+/// `any_confirmed_this_scan`). Requires the peer to be both confirmed AND
+/// ahead (`is_better_chain` → `cw_better`).
+///
+/// Gating on `cw_better` is the PR #13 review round-3 P2 fix: a confirmed peer
+/// at or behind our tip is not a strict IBD candidate, so letting it reset the
+/// timer kept the fallback permanently disarmed whenever the only *ahead*
+/// peers were unconfirmed — re-forming the exact wedge this path exists to
+/// break. Cooldown is deliberately NOT a factor here: a confirmed, ahead peer
+/// merely waiting out its cooldown is still a real candidate and must keep the
+/// relaxed path suppressed (the strict bucket picks it up once cooldown
+/// expires).
+fn confirmed_peer_blocks_fallback(tip_confirmed: bool, cw_better: bool) -> bool {
+    tip_confirmed && cw_better
+}
+
+/// Liveness `has_confirmed_peer` input. True when some peer currently carries
+/// `tip.confirmed` (`best_confirmed_work != 0`) OR we hold proof-by-delivery:
+/// a completed `run_ibd` PoW-validated a chain whose cumulative work our own
+/// tip has reached (`our_work >= proven_work`).
+///
+/// The delivery clause is the PR #13 review round-3 P1 fix. Liveness keys off
+/// `best_confirmed_work`, which counts only peers flagged `tip.confirmed=true`.
+/// The wedge-fallback path IBDs from an *unconfirmed* peer; if its post-IBD
+/// GetTip handshake times out or it is evicted before confirming, no peer is
+/// confirmed, `has_confirmed_peer` stays false, `is_live` never flips and
+/// `mining_cancel` stays set — the node reads as wedged despite holding a
+/// fully validated chain. A completed `run_ibd` is strictly stronger evidence
+/// than the GetTip block-id-at-height check (every header and block was
+/// streamed to our tip and PoW-validated), so it must feed the liveness gate,
+/// not just the IBD-candidate gate.
+///
+/// It never makes us think a peer is *ahead*: `peer_ahead` keys off
+/// `best_confirmed_work` alone, so a stale delivery floor cannot suppress a
+/// later genuine Live → CatchingUp revert.
+fn has_liveness_proof(
+    best_confirmed_work: [u8; 32],
+    proven_by_delivery: Option<[u8; 32]>,
+    our_work: [u8; 32],
+) -> bool {
+    best_confirmed_work != [0u8; 32] || proven_by_delivery.is_some_and(|w| our_work >= w)
+}
+
 /// The central sync manager task. Processes all block events, drives IBD,
 /// manages sync state. Runs as a single node-wide task.
 ///
@@ -6684,6 +6729,13 @@ pub async fn run_sync_manager(node: Arc<Node>, mut rx: mpsc::Receiver<PeerEvent>
     node.sync_state
         .store(SyncState::CatchingUp as u8, Ordering::Relaxed);
     let mut is_live = false;
+
+    // Proof-by-delivery floor for the liveness gate (PR #13 review round-3
+    // P1). Set to our tip's cumulative work on every successful `run_ibd`.
+    // `has_liveness_proof` honours it so a wedge-fallback IBD from an
+    // unconfirmed peer can make the node live even if no peer ever crosses
+    // `tip.confirmed=true` (missed post-IBD GetTip, or peer evicted first).
+    let mut proven_by_delivery: Option<[u8; 32]> = None;
 
     loop {
         if node.shutdown.load(Ordering::SeqCst) {
@@ -6957,15 +7009,6 @@ pub async fn run_sync_manager(node: Arc<Node>, mut rx: mpsc::Receiver<PeerEvent>
                     best_tip = Some(*tip);
                 }
 
-                // Track best confirmed cumulative work + whether anyone is
-                // confirmed this scan.
-                if tip.confirmed {
-                    any_confirmed_this_scan = true;
-                    if tip.cumulative_work > best_conf_work {
-                        best_conf_work = tip.cumulative_work;
-                    }
-                }
-
                 let cooldown_ok = lp.ibd_cooldown_until.map_or(true, |until| now >= until);
                 let peer_ct = ChainTip {
                     block_id: tip.block_id,
@@ -6973,6 +7016,23 @@ pub async fn run_sync_manager(node: Arc<Node>, mut rx: mpsc::Receiver<PeerEvent>
                     cumulative_work: tip.cumulative_work,
                 };
                 let cw_better = is_better_chain(&peer_ct, &our_tip);
+
+                // Track best confirmed cumulative work — feeds the liveness
+                // gate, where EVERY confirmed peer counts (at-or-behind
+                // included: a confirmed peer at our tip is exactly the
+                // "caught up, go Live" signal).
+                if tip.confirmed && tip.cumulative_work > best_conf_work {
+                    best_conf_work = tip.cumulative_work;
+                }
+                // `any_confirmed_this_scan` gates the wedge-fallback re-arm
+                // timer and relaxed-bucket suppression, so it must require the
+                // peer be confirmed AND ahead (PR #13 review round-3 P2): a
+                // confirmed peer at or behind us is not a strict candidate, and
+                // letting it reset the timer kept the fallback disarmed while
+                // the only ahead peers were unconfirmed — re-forming the wedge.
+                if confirmed_peer_blocks_fallback(tip.confirmed, cw_better) {
+                    any_confirmed_this_scan = true;
+                }
 
                 // Strict gate — only confirmed peers (current or sticky
                 // `ever_confirmed_for_ibd`) can trigger IBD. Unconfirmed
@@ -7243,8 +7303,19 @@ pub async fn run_sync_manager(node: Arc<Node>, mut rx: mpsc::Receiver<PeerEvent>
             match run_ibd(&node, &mut rx, peer_identity, peer_session_id).await {
                 Ok(()) => {
                     info!("Sync manager: IBD complete");
-                    last_tip_height = node.tip.read().await.height;
+                    let new_tip = node.tip.read().await.clone();
+                    last_tip_height = new_tip.height;
                     last_tip_change = Instant::now();
+
+                    // P1 (PR #13 review round-3): record proof-by-delivery so
+                    // the liveness gate honours this completed IBD even if no
+                    // peer ever crosses `tip.confirmed=true`. On the wedge-
+                    // fallback path we IBD from an unconfirmed peer; should its
+                    // post-IBD GetTip below time out or the peer be evicted
+                    // first, `best_confirmed_work` stays zero and `is_live`
+                    // would never flip — leaving the node caught up but with
+                    // mining suppressed. `has_liveness_proof` uses this floor.
+                    proven_by_delivery = Some(new_tip.cumulative_work);
 
                     // Change B (pairs with the wedge-fallback path): a
                     // successful `run_ibd` is proof-of-chain by delivery — the
@@ -7392,7 +7463,8 @@ pub async fn run_sync_manager(node: Arc<Node>, mut rx: mpsc::Receiver<PeerEvent>
         let peer_ahead = best_confirmed_work > our_work;
 
         if !is_live {
-            let has_confirmed_peer = best_confirmed_work != [0u8; 32];
+            let has_confirmed_peer =
+                has_liveness_proof(best_confirmed_work, proven_by_delivery, our_work);
             if has_confirmed_peer && (!peer_ahead || recent_progress) {
                 is_live = true;
             } else if connected_count == 0 && !ever_had_peer
@@ -9856,5 +9928,122 @@ mod ibd_eligibility_tests {
         let t2 = t1 + Duration::from_secs(100);
         let re_armed = next_strict_absent_since(disarmed, t2, false, false);
         assert_eq!(re_armed, Some(t2));
+    }
+
+    // ── P2 round-3: confirmed-but-behind peer must not suppress fallback ──
+
+    use super::{confirmed_peer_blocks_fallback, has_liveness_proof};
+
+    /// Cumulative-work fixture. `[u8; 32]` compares lexicographically from the
+    /// high byte, matching the convention `is_better_chain` / `peer_ahead`
+    /// rely on, so larger `n` ⇒ strictly greater work; `work(0)` is the
+    /// no-confirmed-peer sentinel `[0u8; 32]`.
+    fn work(n: u8) -> [u8; 32] {
+        let mut a = [0u8; 32];
+        a[0] = n;
+        a
+    }
+
+    #[test]
+    fn confirmed_and_ahead_peer_blocks_fallback() {
+        // The normal sticky-candidate signal: a confirmed peer that is also
+        // ahead resets the re-arm timer and suppresses the relaxed bucket.
+        assert!(confirmed_peer_blocks_fallback(
+            /* tip_confirmed */ true,
+            /* cw_better */ true,
+        ));
+    }
+
+    #[test]
+    fn confirmed_but_behind_peer_does_not_block_fallback() {
+        // THE round-3 P2 regression. A confirmed peer at or behind our tip is
+        // not a strict IBD candidate. Pre-fix it set `any_confirmed_this_scan`
+        // anyway, resetting `strict_absent_since` every scan so the fallback
+        // never armed while the only ahead peers were unconfirmed — the wedge
+        // re-formed. Post-fix it does not block the fallback.
+        assert!(!confirmed_peer_blocks_fallback(
+            /* tip_confirmed */ true,
+            /* cw_better */ false,
+        ));
+    }
+
+    #[test]
+    fn unconfirmed_peer_never_blocks_fallback() {
+        // An unconfirmed peer — ahead or not — is exactly what the relaxed
+        // path exists for; it must never count as a confirmation observation.
+        assert!(!confirmed_peer_blocks_fallback(false, true));
+        assert!(!confirmed_peer_blocks_fallback(false, false));
+    }
+
+    #[test]
+    fn stale_confirmed_peer_lets_timer_keep_arming() {
+        // Loop-level composition of the round-3 P2 fix: a confirmed-but-behind
+        // peer present every scan (e.g. a peer pinned at our own tip) yields
+        // `any_confirmed_this_scan = false`, so the strict-absent timer keeps
+        // counting from when the wedge began and the fallback can still arm.
+        // Pre-fix the same peer reset the timer to `None` every scan.
+        let any_confirmed_this_scan = confirmed_peer_blocks_fallback(
+            /* tip_confirmed */ true,
+            /* cw_better */ false,
+        );
+        assert!(!any_confirmed_this_scan);
+        let t0 = Instant::now() - Duration::from_secs(1200);
+        let armed = next_strict_absent_since(
+            Some(t0),
+            Instant::now(),
+            /* strict_present */ false,
+            any_confirmed_this_scan,
+        );
+        assert_eq!(armed, Some(t0), "stale confirmed peer must not reset timer");
+    }
+
+    // ── P1 round-3: proof-by-delivery feeds the liveness gate ────────────
+
+    #[test]
+    fn liveness_proof_from_currently_confirmed_peer() {
+        // Healthy path: a peer carries `tip.confirmed=true`, so
+        // `best_confirmed_work != 0` and the node is live regardless of
+        // whether any IBD has been delivered this process.
+        assert!(has_liveness_proof(
+            /* best_confirmed_work */ work(5),
+            /* proven_by_delivery */ None,
+            /* our_work */ work(5),
+        ));
+    }
+
+    #[test]
+    fn no_confirmed_peer_and_no_delivery_is_not_live() {
+        // The wedge state before any IBD completes: nothing proves a peer's
+        // chain, so the node correctly stays CatchingUp.
+        assert!(!has_liveness_proof(
+            /* best_confirmed_work */ work(0),
+            /* proven_by_delivery */ None,
+            /* our_work */ work(3),
+        ));
+    }
+
+    #[test]
+    fn proof_by_delivery_goes_live_without_a_confirmed_peer() {
+        // THE round-3 P1 regression: wedge-fallback IBD from an unconfirmed
+        // peer completed, but its post-IBD GetTip was missed (or the peer was
+        // evicted) so no peer is flagged `tip.confirmed`. Pre-fix
+        // `has_confirmed_peer` stayed false and mining was suppressed despite a
+        // fully validated chain. Post-fix the delivery floor makes us live.
+        assert!(has_liveness_proof(
+            /* best_confirmed_work */ work(0),
+            /* proven_by_delivery */ Some(work(7)),
+            /* our_work */ work(7),
+        ));
+    }
+
+    #[test]
+    fn delivery_floor_requires_our_tip_to_have_reached_it() {
+        // Defensive: the floor only counts once our own tip has actually
+        // reached the delivered work. `our_work >= proven` holds for real post-
+        // IBD states (our tip IS the delivered chain); a lower `our_work` must
+        // not be treated as live.
+        assert!(!has_liveness_proof(work(0), Some(work(7)), work(6)));
+        assert!(has_liveness_proof(work(0), Some(work(7)), work(7)));
+        assert!(has_liveness_proof(work(0), Some(work(7)), work(9)));
     }
 }
