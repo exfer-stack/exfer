@@ -26,3 +26,5 @@ pub use builder::ScriptBuilder;
 #[allow(unused_imports)]
 #[cfg(feature = "channels")]
 pub use channel::{ChannelState, PaymentChannel};
+#[allow(unused_imports)]
+pub use htlc::{try_parse_htlc, HtlcParams};
