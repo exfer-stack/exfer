@@ -223,6 +223,12 @@ async fn handle_connection(
     // SSE handler — the SSE handler holds its own pool slot. The caller's
     // `_permit` Drop fires at scope exit, freeing the RPC slot.
     let request_line = header_str.lines().next().unwrap_or("");
+    tracing::info!(
+        peer = %addr,
+        bytes = header_buf.len(),
+        first_line = %request_line,
+        "rpc: received request"
+    );
     if let Some(rest) = request_line.strip_prefix("GET /sse") {
         // rest is either "" / "?<query> HTTP/1.1" — pull the query out.
         let after_path = rest.split_whitespace().next().unwrap_or("");
