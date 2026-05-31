@@ -218,13 +218,12 @@ async fn handle_connection(
 
     let header_str_raw = String::from_utf8_lossy(&header_buf);
 
-    // PROXY protocol v1 stripping: some edge proxies (fly.io's TCP
-    // service when fronting external traffic) prepend a "PROXY TCP4
-    // src dst sport dport\r\n" line before the HTTP request, regardless
-    // of whether `handlers = ["proxy_proto"]` was explicitly requested.
-    // Skip past it so the rest of this function sees a clean HTTP
-    // request line. Internal loopback connections never carry the
-    // PROXY line, so the unconditional strip below works for both.
+    // PROXY protocol v1 stripping: some L4 load balancers prepend a
+    // "PROXY TCP4 src dst sport dport\r\n" line before the HTTP request
+    // so the upstream sees the real client IP. Skip past it so the rest
+    // of this function sees a clean HTTP request line. Direct connections
+    // never carry the PROXY line, so the unconditional strip is a no-op
+    // there.
     let header_str: std::borrow::Cow<'_, str> = if header_str_raw.starts_with("PROXY ") {
         match header_str_raw.find("\r\n") {
             Some(eol) => std::borrow::Cow::Owned(header_str_raw[eol + 2..].to_string()),
@@ -234,21 +233,12 @@ async fn handle_connection(
         header_str_raw
     };
 
-    // DEBUG: dump first 200 bytes raw so we can see what shape proxies
-    // deliver. Strip after the fly-edge story is understood.
-    eprintln!(
-        "RPC-RAW[{addr}] bytes={} first_line={:?}",
-        header_buf.len(),
-        header_str.lines().next().unwrap_or("")
-    );
-
     // Phase 2 SSE: detect SSE upgrade requests and hand off to the
     // long-lived handler. We accept BOTH `GET /sse?addresses=...` (the
-    // canonical Electrum-style form) AND `POST /sse?addresses=...` (a
-    // POST-equivalent that survives proxies which mangle GETs — fly.io's
-    // TCP edge with `handlers = []` has been observed to short-circuit
-    // GET requests with a 405 before they reach the application, while
-    // POST passes through cleanly).
+    // canonical Electrum-style form, curl-friendly) AND
+    // `POST /sse?addresses=...` (a POST-equivalent for clients behind
+    // proxies that mangle GETs or reject empty-body requests — the body
+    // is ignored either way, addresses live in the query string).
     //
     // The body of a POST /sse is ignored — addresses live in the query
     // string either way so we don't have to read or parse the body for
@@ -284,16 +274,7 @@ async fn handle_connection(
     const MAX_RPC_BODY_SCRIPT: usize = 200_000; // ~200 KB for get_script_utxos
     const MAX_RPC_BODY_SMALL: usize = 65_536; // 64 KB
     if content_length == 0 || content_length > MAX_RPC_BODY {
-        // DEBUG: include the first 200 bytes of the header so we can see
-        // exactly what the proxy edge is sending. Strip once after the
-        // fly-edge PROXY-or-whatever issue is fully understood.
-        let preview: String = header_buf
-            .iter()
-            .take(200)
-            .map(|&b| if (32..127).contains(&b) { b as char } else if b == b'\r' { '_' } else if b == b'\n' { '|' } else { '.' })
-            .collect();
-        let msg = format!("Invalid Content-Length; preview: {preview}");
-        send_http_response(&mut stream, 400, msg.as_bytes()).await?;
+        send_http_response(&mut stream, 400, b"Invalid Content-Length").await?;
         return Ok(());
     }
 
@@ -305,14 +286,10 @@ async fn handle_connection(
     let rpc_req: RpcRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
         Err(_) => {
-            // DEBUG: include the request line so we can see what fly's
-            // edge actually delivered. Strip once the SSE routing is
-            // confirmed working through fly.
-            let req_line = header_str.lines().next().unwrap_or("");
             let resp = RpcResponse::err(
                 serde_json::Value::Null,
                 PARSE_ERROR,
-                format!("Parse error (request_line={req_line:?})"),
+                "Parse error".to_string(),
             );
             send_rpc_response(&mut stream, &resp).await?;
             return Ok(());
