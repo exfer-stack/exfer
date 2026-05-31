@@ -305,10 +305,14 @@ async fn handle_connection(
     let rpc_req: RpcRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
         Err(_) => {
+            // DEBUG: include the request line so we can see what fly's
+            // edge actually delivered. Strip once the SSE routing is
+            // confirmed working through fly.
+            let req_line = header_str.lines().next().unwrap_or("");
             let resp = RpcResponse::err(
                 serde_json::Value::Null,
                 PARSE_ERROR,
-                "Parse error".to_string(),
+                format!("Parse error (request_line={req_line:?})"),
             );
             send_rpc_response(&mut stream, &resp).await?;
             return Ok(());
