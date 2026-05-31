@@ -802,6 +802,32 @@ mod tests {
             .expect("admit")
     }
 
+    #[tokio::test]
+    async fn add_validated_emits_script_changed_for_recipient_and_sender() {
+        // Phase 2 SSE smoke: admitting a tx into the mempool should nudge
+        // any subscriber watching either the recipient (incoming) script
+        // or the sender (outgoing / spend-side) script.
+        let recipient = [10u8; 32];
+        let (utxo_set, tx, sender_script, recipient_script) = signed_spend(&recipient, b"E");
+        let bus = crate::events::EventBus::new();
+        let (_recv_id, mut recv_rx) = bus.subscribe(&[recipient_script.clone()]);
+        let (_send_id, mut send_rx) = bus.subscribe(&[sender_script.clone()]);
+        let mut mempool = Mempool::new();
+        mempool.set_event_bus(bus);
+        add_validated_with_snapshot(&mut mempool, &utxo_set, tx, 100);
+
+        // Recipient subscriber must see its script in the nudge.
+        match recv_rx.try_recv() {
+            Ok(crate::events::ChainEvent::ScriptChanged(s)) => assert_eq!(s, recipient_script),
+            other => panic!("recipient subscriber: expected ScriptChanged, got {:?}", other),
+        }
+        // Sender subscriber must see its (spent-input) script in the nudge.
+        match send_rx.try_recv() {
+            Ok(crate::events::ChainEvent::ScriptChanged(s)) => assert_eq!(s, sender_script),
+            other => panic!("sender subscriber: expected ScriptChanged, got {:?}", other),
+        }
+    }
+
     #[test]
     fn add_validated_indexes_incoming_and_outgoing() {
         let recipient = [7u8; 32];
