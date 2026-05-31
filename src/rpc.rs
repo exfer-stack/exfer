@@ -222,13 +222,15 @@ async fn handle_connection(
     // JSON-RPC pool permit BY MOVING ownership of the stream into the
     // SSE handler — the SSE handler holds its own pool slot. The caller's
     // `_permit` Drop fires at scope exit, freeing the RPC slot.
+    //
+    // Note: fly.io's TCP proxy (handlers=[] mode) appears to mangle
+    // external GET requests in some way that prevents this branch from
+    // matching for clients hitting the fly-edge — internal loopback
+    // calls to the same endpoint work. Workaround: walletd's SseClient
+    // probe-and-fallback silently switches to its existing 2 s poll
+    // loop when SSE isn't reachable, so end users still get correct
+    // (if slower) updates while the deployment story is sorted.
     let request_line = header_str.lines().next().unwrap_or("");
-    tracing::info!(
-        peer = %addr,
-        bytes = header_buf.len(),
-        first_line = %request_line,
-        "rpc: received request"
-    );
     if let Some(rest) = request_line.strip_prefix("GET /sse") {
         // rest is either "" / "?<query> HTTP/1.1" — pull the query out.
         let after_path = rest.split_whitespace().next().unwrap_or("");
