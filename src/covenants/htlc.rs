@@ -56,8 +56,12 @@ pub fn htlc(
 
 /// Lifecycle state of an on-chain HTLC, observable to any indexer that
 /// follows the chain.
+///
+/// `#[non_exhaustive]` so future variants (e.g. `PartiallyClaimed` for a
+/// multi-arm covenant) can be added without breaking downstream consumers.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum HtlcState {
     /// Outpoint is still in the UTXO set and `current_height <= timeout_height`.
     Locked,
@@ -75,8 +79,12 @@ pub enum HtlcState {
 }
 
 /// Relationship of the observing party to an HTLC.
+///
+/// `#[non_exhaustive]` so future variants (e.g. `Custodian` for multi-sig
+/// flows) can be added without breaking downstream consumers.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum HtlcRole {
     /// Observer owns the sender key only.
     Sender,
