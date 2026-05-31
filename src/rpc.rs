@@ -276,7 +276,16 @@ async fn handle_connection(
     const MAX_RPC_BODY_SCRIPT: usize = 200_000; // ~200 KB for get_script_utxos
     const MAX_RPC_BODY_SMALL: usize = 65_536; // 64 KB
     if content_length == 0 || content_length > MAX_RPC_BODY {
-        send_http_response(&mut stream, 400, b"Invalid Content-Length").await?;
+        // DEBUG: include the first 200 bytes of the header so we can see
+        // exactly what the proxy edge is sending. Strip once after the
+        // fly-edge PROXY-or-whatever issue is fully understood.
+        let preview: String = header_buf
+            .iter()
+            .take(200)
+            .map(|&b| if (32..127).contains(&b) { b as char } else if b == b'\r' { '_' } else if b == b'\n' { '|' } else { '.' })
+            .collect();
+        let msg = format!("Invalid Content-Length; preview: {preview}");
+        send_http_response(&mut stream, 400, msg.as_bytes()).await?;
         return Ok(());
     }
 
