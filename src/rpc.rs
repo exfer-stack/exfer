@@ -216,7 +216,23 @@ async fn handle_connection(
         return Ok(());
     }
 
-    let header_str = String::from_utf8_lossy(&header_buf);
+    let header_str_raw = String::from_utf8_lossy(&header_buf);
+
+    // PROXY protocol v1 stripping: some edge proxies (fly.io's TCP
+    // service when fronting external traffic) prepend a "PROXY TCP4
+    // src dst sport dport\r\n" line before the HTTP request, regardless
+    // of whether `handlers = ["proxy_proto"]` was explicitly requested.
+    // Skip past it so the rest of this function sees a clean HTTP
+    // request line. Internal loopback connections never carry the
+    // PROXY line, so the unconditional strip below works for both.
+    let header_str: std::borrow::Cow<'_, str> = if header_str_raw.starts_with("PROXY ") {
+        match header_str_raw.find("\r\n") {
+            Some(eol) => std::borrow::Cow::Owned(header_str_raw[eol + 2..].to_string()),
+            None => header_str_raw,
+        }
+    } else {
+        header_str_raw
+    };
 
     // Phase 2 SSE: detect SSE upgrade requests and hand off to the
     // long-lived handler. We accept BOTH `GET /sse?addresses=...` (the
