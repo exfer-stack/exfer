@@ -218,25 +218,27 @@ async fn handle_connection(
 
     let header_str = String::from_utf8_lossy(&header_buf);
 
-    // Phase 2 SSE: detect `GET /sse?...` and upgrade. We release the
-    // JSON-RPC pool permit BY MOVING ownership of the stream into the
-    // SSE handler — the SSE handler holds its own pool slot. The caller's
-    // `_permit` Drop fires at scope exit, freeing the RPC slot.
+    // Phase 2 SSE: detect SSE upgrade requests and hand off to the
+    // long-lived handler. We accept BOTH `GET /sse?addresses=...` (the
+    // canonical Electrum-style form) AND `POST /sse?addresses=...` (a
+    // POST-equivalent that survives proxies which mangle GETs — fly.io's
+    // TCP edge with `handlers = []` has been observed to short-circuit
+    // GET requests with a 405 before they reach the application, while
+    // POST passes through cleanly).
     //
-    // Note: fly.io's TCP proxy (handlers=[] mode) appears to mangle
-    // external GET requests in some way that prevents this branch from
-    // matching for clients hitting the fly-edge — internal loopback
-    // calls to the same endpoint work. Workaround: walletd's SseClient
-    // probe-and-fallback silently switches to its existing 2 s poll
-    // loop when SSE isn't reachable, so end users still get correct
-    // (if slower) updates while the deployment story is sorted.
+    // The body of a POST /sse is ignored — addresses live in the query
+    // string either way so we don't have to read or parse the body for
+    // the SSE path.
+    //
+    // After hand-off the JSON-RPC pool permit drops at scope exit, so
+    // long-lived streams don't count against MAX_RPC_CONNECTIONS.
     let request_line = header_str.lines().next().unwrap_or("");
-    if let Some(rest) = request_line.strip_prefix("GET /sse") {
-        // rest is either "" / "?<query> HTTP/1.1" — pull the query out.
+    let sse_after_path = request_line
+        .strip_prefix("GET /sse")
+        .or_else(|| request_line.strip_prefix("POST /sse"));
+    if let Some(rest) = sse_after_path {
         let after_path = rest.split_whitespace().next().unwrap_or("");
         let query = after_path.strip_prefix('?').unwrap_or("");
-        // Don't await with the RPC permit still held — the SSE handler
-        // takes its own permit.
         rpc_sse::handle_sse_connection(stream, addr, query, node.event_bus.clone(), sse_conn_sem, sse_per_ip)
             .await;
         return Ok(());
