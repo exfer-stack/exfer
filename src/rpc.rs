@@ -234,6 +234,14 @@ async fn handle_connection(
         header_str_raw
     };
 
+    // DEBUG: dump first 200 bytes raw so we can see what shape proxies
+    // deliver. Strip after the fly-edge story is understood.
+    eprintln!(
+        "RPC-RAW[{addr}] bytes={} first_line={:?}",
+        header_buf.len(),
+        header_str.lines().next().unwrap_or("")
+    );
+
     // Phase 2 SSE: detect SSE upgrade requests and hand off to the
     // long-lived handler. We accept BOTH `GET /sse?addresses=...` (the
     // canonical Electrum-style form) AND `POST /sse?addresses=...` (a
