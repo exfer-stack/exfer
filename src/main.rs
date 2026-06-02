@@ -240,6 +240,25 @@ enum Commands {
         #[arg(long)]
         build_spent_by_index: bool,
     },
+    /// Run an isolated single-node local chain for development & testing.
+    /// Instant blocks, no networking, coinbase spendable after 1 block,
+    /// JSON-RPC + SSE on by default. Requires a testnet build
+    /// (`--features testnet`) for trivial difficulty.
+    Devnet {
+        /// Data directory (safe to delete between runs).
+        #[arg(long, default_value = "devnet-data")]
+        datadir: PathBuf,
+        /// JSON-RPC + SSE bind address.
+        #[arg(long, default_value = "127.0.0.1:9334")]
+        rpc_bind: SocketAddr,
+        /// P2P listen address (bound but unused — devnet is isolated).
+        #[arg(long, default_value = "127.0.0.1:9433")]
+        bind: SocketAddr,
+        /// Mine to this pubkey (hex). Default: an auto-created devnet wallet
+        /// at `<datadir>/devnet-wallet.key` (coins land there).
+        #[arg(long)]
+        miner_pubkey: Option<String>,
+    },
     /// Wallet operations
     Wallet {
         #[command(subcommand)]
@@ -838,7 +857,7 @@ async fn main() {
             build_spent_by_index,
         } => {
             let peers = default_peers_if_empty(peers);
-            if let Err(e) = run_node(bind, peers, datadir, None, repair_perms, rpc_bind, verify_all, no_assume_valid, purge_bans, no_auto_migrate, rebuild_state, full_verify, build_spent_by_index).await {
+            if let Err(e) = run_node(bind, peers, datadir, None, repair_perms, rpc_bind, verify_all, no_assume_valid, purge_bans, no_auto_migrate, rebuild_state, full_verify, build_spent_by_index, false).await {
                 error!("Node failed to start: {e}");
                 std::process::exit(1);
             }
@@ -882,9 +901,76 @@ async fn main() {
             };
             let peers = default_peers_if_empty(raw_peers);
             if let Err(e) =
-                run_node(bind, peers, datadir, Some(pubkey), repair_perms, rpc_bind, verify_all, no_assume_valid, purge_bans, no_auto_migrate, rebuild_state, full_verify, build_spent_by_index).await
+                run_node(bind, peers, datadir, Some(pubkey), repair_perms, rpc_bind, verify_all, no_assume_valid, purge_bans, no_auto_migrate, rebuild_state, full_verify, build_spent_by_index, false).await
             {
                 error!("Node failed to start: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::Devnet {
+            datadir,
+            rpc_bind,
+            bind,
+            miner_pubkey,
+        } => {
+            #[cfg(not(feature = "testnet"))]
+            warn!(
+                "devnet on a NON-testnet build: real difficulty means blocks will NOT mine \
+                 quickly. Rebuild with `--features testnet` (release: `--features \
+                 allow-testnet-release`) for instant devnet blocks."
+            );
+            // Resolve the miner pubkey: an explicit flag, or an auto-created
+            // unencrypted devnet wallet kept in the datadir (coins land there).
+            let (pubkey, wallet_addr) = if let Some(hex_str) = miner_pubkey {
+                let bytes = hex::decode(&hex_str).unwrap_or_else(|e| {
+                    eprintln!("ERROR: invalid --miner-pubkey hex: {e}");
+                    std::process::exit(1);
+                });
+                if bytes.len() != 32 {
+                    eprintln!(
+                        "ERROR: --miner-pubkey must be 32 bytes (64 hex chars), got {}",
+                        bytes.len()
+                    );
+                    std::process::exit(1);
+                }
+                let mut pk = [0u8; 32];
+                pk.copy_from_slice(&bytes);
+                (pk, None)
+            } else {
+                if let Err(e) = std::fs::create_dir_all(&datadir) {
+                    eprintln!("ERROR: cannot create devnet datadir {}: {e}", datadir.display());
+                    std::process::exit(1);
+                }
+                let wpath = datadir.join("devnet-wallet.key");
+                let w = load_or_create_wallet(&wpath, true, true);
+                (w.pubkey(), Some(w.address().to_string()))
+            };
+            println!("exfer devnet — isolated local chain");
+            println!("  datadir:  {}", datadir.display());
+            println!("  RPC+SSE:  http://{rpc_bind}");
+            match &wallet_addr {
+                Some(addr) => println!("  mining to (coins land here):  {addr}"),
+                None => println!("  mining to pubkey:  {}", hex::encode(pubkey)),
+            }
+            if let Err(e) = run_node(
+                bind,
+                vec![],
+                datadir,
+                Some(pubkey),
+                true,
+                Some(rpc_bind),
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                true,
+            )
+            .await
+            {
+                error!("devnet failed to start: {e}");
                 std::process::exit(1);
             }
         }
@@ -2890,6 +2976,7 @@ async fn run_node(
     rebuild_state: bool,
     full_verify: bool,
     build_spent_by_index: bool,
+    devnet: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let assume_valid = !no_assume_valid && !verify_all;
     // Track 1 (issue #6): --full-verify forces open_chain's full structural
@@ -3375,6 +3462,7 @@ async fn run_node(
         tip: Arc::new(RwLock::new(tip)),
         event_bus,
         genesis_id,
+        devnet,
         peers: Arc::new(Mutex::new(
             network::sync::PeerRegistry::new(),
         )),
@@ -3396,10 +3484,18 @@ async fn run_node(
         global_response_limiter: std::sync::Mutex::new((std::time::Instant::now(), 0)),
         reorg_triggers: std::sync::Mutex::new(network::sync::ReorgTriggerState::new()),
         peer_events_tx,
-        sync_state: std::sync::atomic::AtomicU8::new(SyncState::CatchingUp as u8),
+        // Devnet boots straight to Live (it IS the network); mainnet starts
+        // CatchingUp and the sync manager promotes it.
+        sync_state: std::sync::atomic::AtomicU8::new(if devnet {
+            SyncState::Live as u8
+        } else {
+            SyncState::CatchingUp as u8
+        }),
         best_peer_work: std::sync::Mutex::new([0u8; 32]),
         ever_confirmed_peer: std::sync::atomic::AtomicBool::new(false),
-        mining_cancel: std::sync::atomic::AtomicBool::new(true),
+        // true = mining paused. Devnet mines immediately; mainnet stays
+        // paused until the sync manager goes Live.
+        mining_cancel: std::sync::atomic::AtomicBool::new(!devnet),
         assume_valid,
         assume_valid_verified: std::sync::atomic::AtomicBool::new(checkpoint_proven),
         frame_budget: network::frame_budget::FrameBudget::new(),
@@ -3417,17 +3513,26 @@ async fn run_node(
         }
     });
 
-    // Spawn the central sync manager
-    let sync_node = node.clone();
-    tokio::spawn(async move {
-        run_sync_manager(sync_node, peer_events_rx).await;
-    });
+    // Networking is skipped entirely in devnet: it is an isolated single
+    // node, so there is no IBD, no peers to dial, and no discovery. Mined
+    // blocks are committed directly via `process_block`, so the sync
+    // manager is not needed to advance the chain.
+    if !devnet {
+        // Spawn the central sync manager
+        let sync_node = node.clone();
+        tokio::spawn(async move {
+            run_sync_manager(sync_node, peer_events_rx).await;
+        });
 
-    // Start the single outbound manager task (replaces per-address reconnect loops)
-    let outbound_node = node.clone();
-    tokio::spawn(async move {
-        run_outbound_manager(outbound_node).await;
-    });
+        // Start the single outbound manager task (replaces per-address reconnect loops)
+        let outbound_node = node.clone();
+        tokio::spawn(async move {
+            run_outbound_manager(outbound_node).await;
+        });
+    } else {
+        drop(peer_events_rx);
+        info!("devnet: isolated single-node chain — sync/outbound/discovery disabled");
+    }
 
     // Start JSON-RPC server if --rpc-bind is set
     if let Some(rpc_addr) = rpc_bind {
@@ -3447,6 +3552,9 @@ async fn run_node(
     // Background discovery task: queues candidates into outbound_bootstraps
     let discovery_node = node.clone();
     tokio::spawn(async move {
+        if discovery_node.devnet {
+            return; // isolated: never dial out
+        }
         let mut last_flush = std::time::Instant::now();
         loop {
             if discovery_node
@@ -3595,7 +3703,7 @@ async fn mining_loop(node: Arc<Node>, pubkey: [u8; 32]) {
             .map(|d| d.as_secs())
             .unwrap_or(0);
 
-        if now > max_timestamp {
+        if now > max_timestamp && !node.devnet {
             warn!(
                 "Clock ({}) exceeds gap limit (parent {} + {} = {}); \
                  chain may have stalled or clock is skewed — waiting",
@@ -3605,7 +3713,11 @@ async fn mining_loop(node: Arc<Node>, pubkey: [u8; 32]) {
             continue;
         }
 
-        let clamped_timestamp = now.max(min_timestamp);
+        // Clamp into the consensus-valid window [min, max]. On devnet this
+        // also lets a fresh chain started from an old hard-coded genesis
+        // walk its timestamps forward to the present over a few instant
+        // blocks (each at most +MAX_TIMESTAMP_GAP) instead of stalling.
+        let clamped_timestamp = now.clamp(min_timestamp, max_timestamp);
 
         let utxo_set = node.utxo_set.read().await.clone();
         // Clone candidate list under the lock, then release immediately.
